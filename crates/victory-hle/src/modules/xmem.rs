@@ -140,6 +140,11 @@ fn virtual_alloc(
     if placeholder {
         kind |= MEM_RESERVE | MEM_RESERVE_PLACEHOLDER;
     }
+    // A commit or reset at an address the title names may meet memory the
+    // GPU side has in place (`title_calls`).
+    if !base.is_null() {
+        title_calls::prepare(base as usize, size, kind & MEM_COMMIT != 0);
+    }
     let mut parameter = MEM_EXTENDED_PARAMETER::default();
     parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
     parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
@@ -344,7 +349,8 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            // As the title's own frees go: what is in place there goes first.
+            title_calls::free(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
@@ -368,7 +374,38 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// Whether the GPU side places title memory in place (`VICTORY_INPLACE`
+/// above 0; unset is 2, on): then the page pool is made so that a host
+/// heap can be opened on it. The same rule as `victory_gpu`'s
+/// `inplace::requested`: unset or empty is on, a number is its level, any
+/// other value is off.
+pub(crate) fn in_place_requested() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| match std::env::var("VICTORY_INPLACE").as_deref().map(str::trim) {
+        Err(_) | Ok("") => true,
+        Ok(v) => v.parse::<u8>().is_ok_and(|n| n > 0),
+    });
+    *ON
+}
+
+/// With in place on, the page pool is made of committed sections of at
+/// most this many pages (256 MiB). A committed section is charged against
+/// the system's commit when it is made, and one of the 6.1 GiB the title
+/// asks for at once is often refused (error 1450: the kernel's prototype
+/// page tables for the whole section are one allocation); sections of
+/// this size are not. Each is one heap on the GPU side, so a title range
+/// that runs over two of them is copied, not placed (counted there).
+const POOL_SECTION_PAGES: usize = 4096;
+
+/// The pages of each section an allocation of `n` pages is made of.
+fn pool_sections(n: usize, most: usize) -> Vec<usize> {
+    let most = most.max(1);
+    (0..n.div_ceil(most)).map(|i| (n - i * most).min(most)).collect()
+}
+
+/// A section of physical pages: its handle, and whether it was made
+/// committed (`SEC_COMMIT`): its pages need no commit when mapped, and the
+/// GPU side can open it as a heap.
+struct Section(HANDLE, bool);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -377,9 +414,77 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        // Said before the handle is closed, so that its number cannot name
+        // another section on the GPU side meanwhile.
+        victory_gpu::title_memory_section(self.0 as usize, 0, false);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
+}
+
+/// A pagefile-backed section of `size` bytes, committed or reserved.
+fn new_section(size: usize, committed: bool) -> Result<Section, std::io::Error> {
+    // SAFETY: plain section creation.
+    let handle = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            std::ptr::null(),
+            PAGE_READWRITE | if committed { SEC_COMMIT } else { SEC_RESERVE },
+            (size as u64 >> 32) as u32,
+            size as u32,
+            std::ptr::null(),
+        )
+    };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    victory_gpu::title_memory_section(handle as usize, size as u64, committed);
+    Ok(Section(handle, committed))
+}
+
+/// The sections for an allocation of `n` pages, with the pages of each.
+///
+/// In place off: one section, reserved, its pages
+/// committed when first mapped or written (`commit`), since the title
+/// asks for 6.1 GiB at once, which a busy host often cannot commit (error
+/// 1450); under Wine committed whole, since a committed section is a
+/// sparse file there, free until touched, and committing a reserved one
+/// page by page costs a wineserver request each that scans every range
+/// committed so far.
+///
+/// In place on: committed sections of [`POOL_SECTION_PAGES`] at most, which
+/// the GPU side can open as heaps. If Windows refuses one, the sections
+/// made so far go and the allocation is made as with in place off (said
+/// once per refusal); its memory is then copied, not placed.
+fn pool(n: usize) -> Result<Vec<(Arc<Section>, usize)>, std::io::Error> {
+    if in_place_requested() {
+        let mut made: Vec<(Arc<Section>, usize)> = Vec::new();
+        let mut refused = None;
+        for pages in pool_sections(n, POOL_SECTION_PAGES) {
+            match new_section(pages * PAGE, true) {
+                Ok(section) => made.push((Arc::new(section), pages)),
+                Err(error) => {
+                    refused = Some(error);
+                    break;
+                }
+            }
+        }
+        let Some(error) = refused else {
+            return Ok(made);
+        };
+        let done: usize = made.iter().map(|m| m.1).sum();
+        drop(made);
+        victory_core::causes::note(victory_core::causes::Cause::PoolOldForm);
+        tracing::warn!(
+            "the page pool's openable form refused by Windows ({error}) after {} of {} MB in committed sections of {} MB: \
+             this allocation is made reserved, as with VICTORY_INPLACE=0, and its memory is copied, not placed in place; \
+             a bigger paging file or fewer other programs make room for it",
+            (done * PAGE) >> 20,
+            (n * PAGE) >> 20,
+            (POOL_SECTION_PAGES * PAGE) >> 20
+        );
+    }
+    Ok(vec![(Arc::new(new_section(n * PAGE, on_wine())?), n)])
 }
 
 /// Where a page lives, or what a view starts with: a section and a page
@@ -434,55 +539,42 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
-        return 0;
-    };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
+    if n.checked_mul(PAGE).is_none_or(|s| s == 0) {
         return 0;
     }
+    // Page numbers are opaque to the title: which section a page lies in
+    // is ours to choose ([`pool`]).
+    let sections = match pool(n) {
+        Ok(sections) => sections,
+        Err(error) => {
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
+    };
     tracing::debug!(
         n,
+        sections = sections.len(),
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+    let mut k = 0;
+    for (section, count) in sections {
+        for index in 0..count {
+            let slice = Slice {
+                section: section.clone(),
+                index,
+            };
+            let number = first + k * FRAMES;
+            physical.pages.insert(number, slice);
+            // SAFETY: the title passes room for `n` page numbers.
+            unsafe { pages.add(k).write(number) };
+            k += 1;
+        }
     }
     1
 }
@@ -531,7 +623,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        commit(at.Value as usize, len, slice.section.1).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -710,6 +802,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
+            victory_core::causes::note(victory_core::causes::Cause::MapPagesFailed);
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
             return std::ptr::null_mut();
         };
@@ -724,6 +817,7 @@ pub extern "system" fn XMemMapPhysicalPages(
             })
             .count();
         if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+            victory_core::causes::note(victory_core::causes::Cause::MapPagesFailed);
             return std::ptr::null_mut();
         }
         i += run;
@@ -786,9 +880,11 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
                 section: s.section.clone(),
             })
         else {
+            victory_core::causes::note(victory_core::causes::Cause::MapPagesFailed);
             return false;
         };
         if !map(&mut physical, to + k, PAGE, slice) {
+            victory_core::causes::note(victory_core::causes::Cause::MapPagesFailed);
             return false;
         }
     }
@@ -828,7 +924,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if !commit(base, len, slice.section.1) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -844,10 +940,11 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     true
 }
 
-/// Commits the section pages a view shows (once per page, whichever view).
-fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
+/// Commits the section pages a view shows (once per page, whichever view);
+/// nothing to do for a section made committed.
+fn commit(base: usize, len: usize, committed: bool) -> bool {
+    if committed || on_wine() {
+        return true; // committed whole when made
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
@@ -1034,6 +1131,494 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     moved.into()
 }
 
+/// The title's own calls that free, decommit or protect its memory, and
+/// those that commit at an address it names: on the way to the host they
+/// first let go of what the GPU side has in place there and wait for the
+/// heaps over it to go (`victory_gpu::title_memory_freeing`), since while
+/// a heap opened on private memory stands, the host refuses such a call
+/// (error 87). A change that still finds a heap there (a list or a slot
+/// of ours still holds it) is held and made as soon as the heap is gone;
+/// the title is told it was made, which for a free, a decommit or a
+/// protection that takes access away is what a correct title can observe.
+/// With in place off every call goes straight to the host.
+pub(crate) mod title_calls {
+    use std::ffi::c_void;
+    use std::sync::{Mutex, MutexGuard};
+
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError, HANDLE, SetLastError};
+    use windows_sys::Win32::System::Memory as sys;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetProcessId};
+    use windows_sys::core::BOOL;
+
+    use crate::{HleModule, hle_export};
+
+    /// The host's page.
+    const SMALL: usize = 4096;
+    /// Protections that let code run: a change to one is never held (code
+    /// would run in pages not yet executable), only waited for longer.
+    const EXECUTABLE: u32 = 0xf0;
+
+    /// A change the title asked for that waits for a heap.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Change {
+        Release,
+        Decommit,
+        Protect(u32),
+    }
+
+    /// A held change: from `at`, `len` bytes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Held {
+        pub(crate) at: usize,
+        pub(crate) len: usize,
+        pub(crate) change: Change,
+    }
+
+    impl Held {
+        fn meets(&self, at: usize, len: usize) -> bool {
+            self.at < at.saturating_add(len) && at < self.at.saturating_add(self.len)
+        }
+    }
+
+    /// Held changes, in the order the title asked for them.
+    static HELD: Mutex<Vec<Held>> = Mutex::new(Vec::new());
+
+    fn held() -> MutexGuard<'static, Vec<Held>> {
+        HELD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What became of a title call.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum Outcome {
+        /// Made, with what the host answered.
+        Made(BOOL),
+        /// To be held.
+        Held,
+    }
+
+    /// The order every call keeps: `freeing` first (it lets go of what is
+    /// in place over `[at, at + len)` and waits for the heaps there); the
+    /// call only when it says no heap stands; a call the host refuses with
+    /// error 87 once more after another round, since a heap may have been
+    /// opened over the range between the two; while a heap still stands, a
+    /// change that `can_hold` is held, and any other is asked again (at
+    /// most three rounds) and then made, failing as the host says.
+    pub(crate) fn change(
+        at: usize,
+        len: usize,
+        can_hold: bool,
+        mut freeing: impl FnMut(usize, usize) -> bool,
+        mut call: impl FnMut() -> (BOOL, u32),
+    ) -> Outcome {
+        for _ in 0..3 {
+            if freeing(at, len) {
+                if can_hold {
+                    return Outcome::Held;
+                }
+                continue;
+            }
+            let (made, error) = call();
+            if made != 0 || error != ERROR_INVALID_PARAMETER {
+                return Outcome::Made(made);
+            }
+        }
+        Outcome::Made(call().0)
+    }
+
+    /// Makes the held changes whose memory no heap covers any more, in
+    /// order; a change that meets an earlier one still held waits behind
+    /// it. `pinned` says whether a heap still stands over a range.
+    pub(crate) fn settle(held: &mut Vec<Held>, mut pinned: impl FnMut(&Held) -> bool, mut make: impl FnMut(&Held)) {
+        let mut kept: Vec<Held> = Vec::with_capacity(held.len());
+        for h in held.drain(..) {
+            if kept.iter().any(|k| k.meets(h.at, h.len)) || pinned(&h) {
+                kept.push(h);
+            } else {
+                make(&h);
+            }
+        }
+        *held = kept;
+    }
+
+    /// Takes `[at, at + len)` out of the held decommits (the title commits
+    /// it again): the bytes taken out, which must read zero as freshly
+    /// committed pages do.
+    pub(crate) fn cut(held: &mut Vec<Held>, at: usize, len: usize) -> Vec<(usize, usize)> {
+        let end = at.saturating_add(len);
+        let mut out = Vec::new();
+        let mut kept = Vec::with_capacity(held.len());
+        for h in held.drain(..) {
+            if h.change != Change::Decommit || !h.meets(at, len) {
+                kept.push(h);
+                continue;
+            }
+            let h_end = h.at + h.len;
+            let (from, to) = (h.at.max(at), h_end.min(end));
+            out.push((from, to - from));
+            if h.at < from {
+                kept.push(Held { len: from - h.at, ..h });
+            }
+            if to < h_end {
+                kept.push(Held { at: to, len: h_end - to, ..h });
+            }
+        }
+        *held = kept;
+        out
+    }
+
+    fn query(at: usize) -> Option<sys::MEMORY_BASIC_INFORMATION> {
+        // SAFETY: plain data filled in by the query.
+        let mut info: sys::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        (unsafe { sys::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) } != 0).then_some(info)
+    }
+
+    /// The host pages that hold `[at, at + size)`; with `size` 0, from
+    /// `at` to the end of its allocation (what a release or a decommit of
+    /// size 0 covers).
+    fn extent(at: usize, size: usize) -> Option<(usize, usize)> {
+        let from = at & !(SMALL - 1);
+        if size != 0 {
+            let end = at.checked_add(size)?.checked_next_multiple_of(SMALL)?;
+            return Some((from, end - from));
+        }
+        let info = query(at)?;
+        let base = info.AllocationBase as usize;
+        let mut end = (info.BaseAddress as usize).checked_add(info.RegionSize)?;
+        while let Some(next) = query(end).filter(|n| n.AllocationBase as usize == base && n.RegionSize > 0) {
+            end = end.checked_add(next.RegionSize)?;
+        }
+        Some((from, end - from))
+    }
+
+    fn ours(process: HANDLE) -> bool {
+        // SAFETY: plain queries; -1 is the current-process pseudo handle.
+        process as isize == -1 || unsafe { GetProcessId(process) == GetCurrentProcessId() }
+    }
+
+    fn hold(h: Held) {
+        let mut list = held();
+        list.push(h);
+        let n = list.len();
+        drop(list);
+        start_worker();
+        victory_core::causes::note(victory_core::causes::Cause::InPlaceHeld);
+        static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+            tracing::warn!(
+                at = format_args!("{:#x}", h.at),
+                len = h.len,
+                change = ?h.change,
+                held = n,
+                "a title memory change is held until the heap in place over it goes"
+            );
+        }
+    }
+
+    /// Makes one held change on the host.
+    fn make(h: &Held) {
+        // SAFETY: the title's own change, made later as it asked for it.
+        let made = unsafe {
+            match h.change {
+                Change::Release => sys::VirtualFree(h.at as *mut c_void, 0, sys::MEM_RELEASE),
+                Change::Decommit => sys::VirtualFree(h.at as *mut c_void, h.len, sys::MEM_DECOMMIT),
+                Change::Protect(protect) => {
+                    let mut old = 0;
+                    sys::VirtualProtect(h.at as *const c_void, h.len, protect, &mut old)
+                }
+            }
+        };
+        if made == 0 {
+            tracing::warn!(at = format_args!("{:#x}", h.at), len = h.len, change = ?h.change, error = %std::io::Error::last_os_error(), "a held title memory change failed when made");
+        } else {
+            tracing::debug!(at = format_args!("{:#x}", h.at), len = h.len, change = ?h.change, "a held title memory change made");
+        }
+    }
+
+    /// A thread of ours that makes held changes once their heaps are gone.
+    fn start_worker() {
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        STARTED.call_once(|| {
+            let started = std::thread::Builder::new().name("victory-held-frees".into()).spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let mut list = held();
+                    if !list.is_empty() {
+                        settle(&mut list, |h| victory_gpu::title_memory_still_pinned(h.at, h.len), make);
+                    }
+                }
+            });
+            if let Err(error) = started {
+                tracing::warn!(%error, "no thread for held title memory changes: they are made at the title's next call there");
+            }
+        });
+    }
+
+    /// Before a title call that commits or resets `[at, at + size)`: held
+    /// changes there are made first if their heaps are gone; a held
+    /// decommit the title commits again is taken back, its bytes zeroed;
+    /// and what is in place there is let go.
+    pub(crate) fn prepare(at: usize, size: usize, commit: bool) {
+        if !super::in_place_requested() || size == 0 {
+            return;
+        }
+        let Some((at, len)) = extent(at, size) else {
+            return;
+        };
+        {
+            let mut list = held();
+            if list.iter().any(|h| h.meets(at, len)) {
+                settle(&mut list, |h| !h.meets(at, len) || victory_gpu::title_memory_still_pinned(h.at, h.len), make);
+                if commit {
+                    for (from, bytes) in cut(&mut list, at, len) {
+                        let writable = query(from).is_some_and(|i| i.State == sys::MEM_COMMIT && i.Protect == sys::PAGE_READWRITE);
+                        if writable {
+                            // SAFETY: committed read-write pages the title
+                            // gave up and now commits again.
+                            unsafe { std::ptr::write_bytes(from as *mut u8, 0, bytes) };
+                        }
+                    }
+                }
+            }
+        }
+        let _ = victory_gpu::title_memory_freeing(at, len);
+    }
+
+    /// A free of the title's: see the module.
+    pub(crate) fn free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
+        // SAFETY: the title's own arguments, as the host takes them.
+        let host = || unsafe { (sys::VirtualFree(address, size, kind), GetLastError()) };
+        // Placeholder splits and joins (`MEM_COALESCE_PLACEHOLDERS` is 0x1).
+        let placeholders = sys::MEM_PRESERVE_PLACEHOLDER | 0x1;
+        let change = match kind {
+            _ if kind & placeholders != 0 => None,
+            _ if kind & sys::MEM_RELEASE != 0 => Some(Change::Release),
+            _ if kind & sys::MEM_DECOMMIT != 0 => Some(Change::Decommit),
+            _ => None,
+        };
+        let (Some(change), true, false) = (change, super::in_place_requested(), address.is_null()) else {
+            return host().0;
+        };
+        let Some((at, len)) = extent(address as usize, size) else {
+            return host().0;
+        };
+        // Behind a held change over the same memory, so that the order the
+        // title asked for stays.
+        if held().iter().any(|h| h.meets(at, len)) {
+            hold(Held { at, len, change });
+            // SAFETY: plain call.
+            unsafe { SetLastError(0) };
+            return 1;
+        }
+        match change_now(at, len, true, host) {
+            Outcome::Made(made) => made,
+            Outcome::Held => {
+                hold(Held { at, len, change });
+                // SAFETY: plain call.
+                unsafe { SetLastError(0) };
+                1
+            }
+        }
+    }
+
+    fn change_now(at: usize, len: usize, can_hold: bool, call: impl FnMut() -> (BOOL, u32)) -> Outcome {
+        change(at, len, can_hold, victory_gpu::title_memory_freeing, call)
+    }
+
+    /// A protection change of the title's: see the module.
+    pub(crate) fn protect(address: *const c_void, size: usize, protect: u32, old: *mut u32) -> BOOL {
+        // SAFETY: the title's own arguments, as the host takes them.
+        let host = || unsafe { (sys::VirtualProtect(address, size, protect, old), GetLastError()) };
+        if !super::in_place_requested() || address.is_null() || size == 0 || old.is_null() {
+            return host().0;
+        }
+        let Some((at, len)) = extent(address as usize, size) else {
+            return host().0;
+        };
+        // What the title is told was the protection: one, of the first page.
+        let before = query(at).map(|i| i.Protect);
+        let can_hold = protect & EXECUTABLE == 0 && before.is_some() && !held().iter().any(|h| h.meets(at, len));
+        match change_now(at, len, can_hold, host) {
+            Outcome::Made(made) => made,
+            Outcome::Held => {
+                hold(Held { at, len, change: Change::Protect(protect) });
+                // SAFETY: the title passes room for the old protection.
+                unsafe {
+                    old.write(before.unwrap_or(sys::PAGE_READWRITE));
+                    SetLastError(0);
+                }
+                1
+            }
+        }
+    }
+
+    pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> BOOL {
+        free(address, size, kind)
+    }
+
+    pub extern "system" fn VirtualFreeEx(process: HANDLE, address: *mut c_void, size: usize, kind: u32) -> BOOL {
+        if ours(process) {
+            return free(address, size, kind);
+        }
+        // SAFETY: the title's own arguments for another process.
+        unsafe { sys::VirtualFreeEx(process, address, size, kind) }
+    }
+
+    pub extern "system" fn VirtualProtect(address: *const c_void, size: usize, new: u32, old: *mut u32) -> BOOL {
+        protect(address, size, new, old)
+    }
+
+    pub extern "system" fn VirtualProtectEx(process: HANDLE, address: *const c_void, size: usize, new: u32, old: *mut u32) -> BOOL {
+        if ours(process) {
+            return protect(address, size, new, old);
+        }
+        // SAFETY: the title's own arguments for another process.
+        unsafe { sys::VirtualProtectEx(process, address, size, new, old) }
+    }
+
+    pub extern "system" fn VirtualAlloc(address: *const c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
+        if !address.is_null() {
+            prepare(address as usize, size, kind & sys::MEM_COMMIT != 0);
+        }
+        // SAFETY: the title's own arguments.
+        unsafe { sys::VirtualAlloc(address, size, kind, protect) }
+    }
+
+    pub extern "system" fn VirtualAllocEx(process: HANDLE, address: *const c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
+        if !address.is_null() && ours(process) {
+            prepare(address as usize, size, kind & sys::MEM_COMMIT != 0);
+        }
+        // SAFETY: the title's own arguments.
+        unsafe { sys::VirtualAllocEx(process, address, size, kind, protect) }
+    }
+
+    pub(crate) fn module() -> HleModule {
+        HleModule {
+            name: "title memory calls",
+            dlls: &["kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
+            exports: vec![
+                hle_export!(VirtualFree),
+                hle_export!(VirtualFreeEx),
+                hle_export!(VirtualProtect),
+                hle_export!(VirtualProtectEx),
+                hle_export!(VirtualAlloc),
+                hle_export!(VirtualAllocEx),
+            ],
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The title's call is made only after the GPU side said no heap
+        /// stands over its memory; while one does, a change that can wait
+        /// is held and the host is not called.
+        #[test]
+        fn a_title_call_goes_to_the_host_only_after_the_heaps_went() {
+            let steps = std::cell::RefCell::new(Vec::new());
+            let outcome = change(
+                0x1000,
+                0x1000,
+                true,
+                |_, _| {
+                    steps.borrow_mut().push("freeing");
+                    false
+                },
+                || {
+                    steps.borrow_mut().push("call");
+                    (1, 0)
+                },
+            );
+            assert_eq!(outcome, Outcome::Made(1));
+            assert_eq!(*steps.borrow(), ["freeing", "call"]);
+
+            let mut called = false;
+            let outcome = change(0x1000, 0x1000, true, |_, _| true, || {
+                called = true;
+                (1, 0)
+            });
+            assert_eq!(outcome, Outcome::Held);
+            assert!(!called, "never made while a heap stands");
+
+            // A heap opened between the two: refused once, made after the
+            // next round.
+            let mut answers = vec![(1, 0), (0, ERROR_INVALID_PARAMETER)];
+            let mut rounds = 0;
+            let outcome = change(0, 1, true, |_, _| {
+                rounds += 1;
+                false
+            }, || answers.pop().unwrap());
+            assert_eq!((outcome, rounds), (Outcome::Made(1), 2));
+
+            // An executable protection is never held: made after the
+            // rounds, failing as the host says.
+            let mut calls = 0;
+            let outcome = change(0, 1, false, |_, _| true, || {
+                calls += 1;
+                (0, ERROR_INVALID_PARAMETER)
+            });
+            assert_eq!((outcome, calls), (Outcome::Made(0), 1));
+        }
+
+        /// Held changes are made in order, each once its heap is gone, and
+        /// never ahead of an earlier one over the same memory.
+        #[test]
+        fn held_changes_keep_their_order() {
+            let a = Held { at: 0x10_000, len: 0x10_000, change: Change::Decommit };
+            let b = Held { at: 0x10_000, len: 0x40_000, change: Change::Release };
+            let c = Held { at: 0x90_000, len: 0x1000, change: Change::Protect(sys::PAGE_READONLY) };
+            let mut list = vec![a, b, c];
+            let mut made = Vec::new();
+            // `a`'s heap still stands: `b` meets it and waits; `c` is free.
+            settle(&mut list, |h| *h == a, |h| made.push(*h));
+            assert_eq!(made, [c]);
+            assert_eq!(list, [a, b]);
+            settle(&mut list, |_| false, |h| made.push(*h));
+            assert_eq!(made, [c, a, b]);
+            assert!(list.is_empty());
+        }
+
+        /// A held decommit the title commits again is taken back where it
+        /// commits, and kept around it.
+        #[test]
+        fn a_commit_takes_back_a_held_decommit() {
+            let d = Held { at: 0x10_000, len: 0x30_000, change: Change::Decommit };
+            let p = Held { at: 0x20_000, len: 0x1000, change: Change::Protect(sys::PAGE_NOACCESS) };
+            let mut list = vec![d, p];
+            let zeroed = cut(&mut list, 0x20_000, 0x8000);
+            assert_eq!(zeroed, [(0x20_000, 0x8000)]);
+            // What is left of the decommit keeps its place ahead of the
+            // later protection change: the title's order.
+            assert_eq!(
+                list,
+                [
+                    Held { at: 0x10_000, len: 0x10_000, change: Change::Decommit },
+                    Held { at: 0x28_000, len: 0x18_000, change: Change::Decommit },
+                    p,
+                ]
+            );
+            assert!(cut(&mut list, 0x80_000, 0x1000).is_empty(), "nothing held there");
+        }
+
+        /// The extent of a size-0 release is its whole allocation, over
+        /// regions of different states.
+        #[test]
+        fn a_release_covers_its_whole_allocation() {
+            // SAFETY: an allocation of the test's own.
+            unsafe {
+                let base = sys::VirtualAlloc(std::ptr::null(), 0x40_000, sys::MEM_RESERVE, sys::PAGE_NOACCESS) as usize;
+                assert_ne!(base, 0);
+                sys::VirtualAlloc((base + 0x10_000) as *const c_void, 0x10_000, sys::MEM_COMMIT, sys::PAGE_READWRITE);
+                assert_eq!(extent(base, 0), Some((base, 0x40_000)));
+                assert_eq!(extent(base + 0x10_123, 0x10), Some((base + 0x10_000, 0x1000)));
+                assert_eq!(extent(base + 0xfff, 2), Some((base, 0x2000)));
+                sys::VirtualFree(base as *mut c_void, 0, sys::MEM_RELEASE);
+            }
+        }
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xmem",
@@ -1059,6 +1644,49 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The page pool's sections with in place on: whole sections of the
+    /// most pages, the rest in the last; the title's 6.1 GiB in 25.
+    #[test]
+    fn the_pool_is_cut_into_sections_small_enough_to_commit() {
+        assert_eq!(pool_sections(1, 4096), [1]);
+        assert_eq!(pool_sections(4096, 4096), [4096]);
+        assert_eq!(pool_sections(4097, 4096), [4096, 1]);
+        let title = (6246 << 20) / PAGE;
+        let cut = pool_sections(title, POOL_SECTION_PAGES);
+        assert_eq!(cut.len(), 25);
+        assert_eq!(cut.iter().sum::<usize>(), title);
+        assert!(cut.iter().all(|&n| n > 0 && n <= POOL_SECTION_PAGES));
+        assert!(pool_sections(0, 4096).is_empty());
+    }
+
+    /// Pages handed out over two sections: numbers go on as one
+    /// allocation, mappings split where the sections do, and every page
+    /// shows its own bytes.
+    #[test]
+    fn pages_over_two_sections_map_as_one_allocation() {
+        if !in_place_requested() {
+            return;
+        }
+        let n = POOL_SECTION_PAGES + 2;
+        let mut count = n;
+        let mut pages = vec![0usize; n];
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()), 1);
+        assert!(pages.windows(2).all(|w| w[1] == w[0] + FRAMES));
+        let tail = &pages[POOL_SECTION_PAGES - 1..];
+        let runs = runs(tail, 0, 3 * PAGE).unwrap();
+        assert_eq!(runs.len(), 2, "one run per section");
+        assert!(runs.iter().all(|(slice, _)| slice.section.1), "committed sections");
+        assert!(write_physical(tail, PAGE - 4, &[7u8; 8]));
+        let reservation = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!reservation.is_null());
+        assert_eq!(XMemMapPhysicalPages(reservation, 3, tail.as_ptr()), reservation);
+        // SAFETY: the three pages just mapped.
+        let shown = unsafe { std::slice::from_raw_parts((reservation as *const u8).add(PAGE - 4), 8) };
+        assert_eq!(shown, [7u8; 8]);
+        assert_eq!(XMemMapPhysicalPages(reservation, 3, std::ptr::null()), reservation);
+        assert_eq!(XMemFreePhysicalPages(n, pages.as_ptr()), 1);
+    }
 
     #[test]
     fn commit_notifications_cover_both_blocks_of_an_unaligned_request() {

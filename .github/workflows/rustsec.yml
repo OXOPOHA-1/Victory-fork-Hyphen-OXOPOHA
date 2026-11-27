@@ -1,0 +1,29 @@
+name: RustSec
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install cargo-audit
+        working-directory: ${{ runner.temp }}
+        run: cargo +stable install --locked --version 0.23.0 --no-default-features cargo-audit
+      - name: Check both lockfiles against the same advisory database
+        working-directory: ${{ runner.temp }}
+        run: |
+          cargo +stable audit --file "$GITHUB_WORKSPACE/Cargo.lock"
+          cargo +stable audit --no-fetch --file "$GITHUB_WORKSPACE/tests/fixtures/hle-probe/Cargo.lock"

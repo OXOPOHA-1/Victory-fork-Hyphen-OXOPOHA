@@ -1,5 +1,6 @@
 //! Copies of title memory made in place, by this process, with a way back
-//! when a page is not there (`VICTORY_COPY_PLAIN=1`; off by default).
+//! when a page is not there (on by default on x86_64; `VICTORY_COPY_PLAIN=0`
+//! turns it off).
 //!
 //! Every copy of title memory into a host buffer goes through the kernel
 //! (`ReadProcessMemory` on our own process, `crate::host::copy_mapped`):
@@ -54,17 +55,18 @@ unsafe extern "C" {
     static victory_copy_guarded_fault: u8;
 }
 
-/// Whether copies of title memory into host memory are made in place
-/// (`VICTORY_COPY_PLAIN=1`).
+/// Whether copies of title memory into host memory are made in place.
+/// On by default on x86_64; set `VICTORY_COPY_PLAIN=0` to force kernel copies.
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_some_and(|v| v == "1");
+        let on = cfg!(target_arch = "x86_64")
+            && !std::env::var_os("VICTORY_COPY_PLAIN").is_some_and(|v| v == "0");
         if on {
             install();
             tracing::info!(
                 "copies of title memory into host buffers are made in place, with the kernel's copy behind them for a \
-                 page that is not there (VICTORY_COPY_PLAIN=1)"
+                 page that is not there (VICTORY_COPY_PLAIN=1; set 0 to disable)"
             );
         }
         on
@@ -100,6 +102,25 @@ fn now_ms() -> u64 {
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
+#[inline(always)]
+fn coarse_now_ms() -> u64 {
+    thread_local! {
+        static CACHE: std::cell::Cell<(u32, u64)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    CACHE.with(|c| {
+        let (n, ms) = c.get();
+        let n = n.wrapping_add(1);
+        if n % 128 == 1 {
+            let now = now_ms();
+            c.set((n, now));
+            now
+        } else {
+            c.set((n, ms));
+            ms
+        }
+    })
+}
+
 /// The numbers of the first and last 64 KiB block of `[from, from + len)`,
 /// never 0 (0 is an empty place).
 fn blocks(from: usize, len: usize) -> (usize, usize) {
@@ -108,7 +129,7 @@ fn blocks(from: usize, len: usize) -> (usize, usize) {
 
 /// Whether a copy from there faulted lately.
 fn faulted_lately(from: usize, len: usize) -> bool {
-    let now = now_ms();
+    let now = coarse_now_ms();
     let emptied = EMPTIED.load(Relaxed);
     if now.saturating_sub(emptied) >= 2_000 && EMPTIED.compare_exchange(emptied, now, Relaxed, Relaxed).is_ok() {
         for place in &RECENT {
@@ -194,6 +215,7 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
         return false;
     }
     if faulted_lately(from as usize, len) {
+        victory_core::causes::note(victory_core::causes::Cause::PlainCopyFallback);
         COUNT[3].fetch_add(1, Relaxed);
         return false;
     }
@@ -202,6 +224,7 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
         COUNT[0].fetch_add(1, Relaxed);
         COUNT[1].fetch_add(len as u64, Relaxed);
     } else {
+        victory_core::causes::note(victory_core::causes::Cause::PlainCopyFallback);
         COUNT[2].fetch_add(1, Relaxed);
         note_fault(from as usize, len);
     }
@@ -225,6 +248,7 @@ pub(crate) fn copy_short(to: *mut u8, from: *const u8, len: usize) -> bool {
         return false;
     }
     if faulted_lately(from as usize, len) {
+        victory_core::causes::note(victory_core::causes::Cause::PlainCopyFallback);
         COUNT[3].fetch_add(1, Relaxed);
         return false;
     }
@@ -232,6 +256,7 @@ pub(crate) fn copy_short(to: *mut u8, from: *const u8, len: usize) -> bool {
     if whole {
         COUNT[5].fetch_add(1, Relaxed);
     } else {
+        victory_core::causes::note(victory_core::causes::Cause::PlainCopyFallback);
         COUNT[2].fetch_add(1, Relaxed);
         note_fault(from as usize, len);
     }

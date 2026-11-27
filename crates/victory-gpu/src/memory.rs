@@ -83,6 +83,18 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// The title heap behind host view heap `heap` is being freed: its run of
+/// slots ([`ready`]) goes with it. Kept by the heap's address, a new heap
+/// made later at the same address would find the old run, take no slots
+/// of its own and write no views there, and other lists' tables could
+/// take those slots.
+pub(crate) fn forget_heap(heap: &HostHeap) {
+    let key = std::ptr::from_ref(heap) as usize;
+    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.heaps.remove(&key);
+    }
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
@@ -178,6 +190,7 @@ impl Memory {
                 n
             }
             None => {
+                victory_core::causes::note(victory_core::causes::Cause::MemoryPageWithoutCopy);
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
@@ -210,6 +223,7 @@ impl Memory {
             }
         }
         if !pages.is_empty() {
+            victory_core::causes::note_n(victory_core::causes::Cause::MemoryPageWithoutCopy, pages.len() as u64);
             // Each is an access that read 0 or was dropped.
             static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {

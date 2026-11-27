@@ -63,6 +63,11 @@ pub(crate) struct Heap {
     /// descriptor records into it as bytes, without a descriptor API call.
     #[cfg(windows)]
     written: Option<crate::watch::Tracked>,
+    /// Identity of this heap, kept with every dynamic slot range so a
+    /// release from a list that outlived it cannot free slots of a new heap
+    /// made later at the same address.
+    #[cfg(windows)]
+    pub(crate) identity: u64,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -94,7 +99,7 @@ impl Heap {
         self.host
             .get_or_init(|| {
                 let step = u64::from(increment(self.desc.kind)?);
-                let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
+                let h = host::HostHeap::new(self.samplers(), self.desc.count)?.with_identity(self.identity);
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
@@ -134,6 +139,10 @@ const SHADER_VISIBLE: u32 = 1;
 /// longer wait for each other. Nothing a holder calls takes it again.
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
+
+/// Heap identities, never reused: an address can be.
+#[cfg(windows)]
+static NEXT_HEAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// One [`sync_heaps`] at a time, as when the list above was a mutex.
 #[cfg(windows)]
@@ -200,6 +209,9 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
+        // Slot changes put off while submissions were in flight
+        // (`HostHeap::defer`): made now if none is.
+        mirrored += host.catch_up_deferred();
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
@@ -256,6 +268,9 @@ pub(crate) fn sync_heaps() {
                             mirrored += 1;
                         }
                     }
+                } else {
+                    // Unmapped meanwhile: its slots keep their views.
+                    victory_core::causes::note(victory_core::causes::Cause::DescriptorPageUnreadable);
                 }
                 page += crate::watch::PAGE;
             }
@@ -379,15 +394,22 @@ fn changed_slots(
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// `heap` only if it is still the heap that took them. A list can outlive
+/// the title heap it recorded slots from: D3D12 keeps a heap alive while a
+/// command list names it, so the title can release it before the lists are
+/// reset, and a new heap can be made at the same address. Without the
+/// identity check that stale release would free the new heap's slots while
+/// other lists still hold them. (`HostHeap::release` checks it too, for
+/// any other caller; here it also stands for the heap being registered.)
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(heap: usize, identity: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
+        && unsafe { &*(heap as *const Heap) }.identity == identity
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.release(first, n);
+        host.release(identity, first, n);
     }
 }
 
@@ -397,6 +419,12 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        drop(heaps);
+        // The run of title-memory views it held goes too: a new heap at
+        // this address takes its own.
+        if let Some(Some(host)) = self.host.get() {
+            crate::memory::forget_heap(host);
+        }
     }
 }
 
@@ -870,20 +898,60 @@ pub(crate) fn texture_made(resource: usize) {
         .push(resource);
 }
 
-/// The slot at `handle` was written with a view of texture `resource`,
-/// which has no host copy: it waits for one.
+/// When views alone make a texture's host copy: for a texture the title
+/// fills, the number of slots that must hold views of it, or `None` for
+/// never (a draw that reads it, or the pass over textures picked by index,
+/// makes it); for a texture the host writes (a target, a depth texture, one
+/// with unordered access), always that number.
+///
+/// A view is not a use. The title writes a view of each texture when it
+/// creates it, and its heap holds tens of thousands of them at once (the
+/// queue of textures picked by index counted 10,000 to 40,000 slots). A host
+/// copy made for a view holds the card's memory of its whole chain (made
+/// level by level only with `VICTORY_LEVELS_ON_DEMAND=1`, and then only for
+/// placed textures), and shows nothing until something uploads it: that is
+/// still the draw that reads it through a table (`draw.rs` `readable`, in
+/// the same submission) or the pass over textures picked by index (`draw.rs`
+/// `heap_textures`, within its budget and while the card has room). Its slot
+/// read zeros either way; what the early copy did was count against the
+/// card's room (`resource::room`), so that the pass held back the textures
+/// draws did need, and the sweep let go of copies in use. A texture the host
+/// writes has no contents but the card's: a shader that writes it through a
+/// view it picks by index writes into nothing unless the copy is there, so
+/// its views still make it.
+///
+/// `VICTORY_WAIT_MOST=<n>` (n >= 1): views make the host copy of any texture
+/// once `n` slots hold views of it, filled or not, as when every view was
+/// taken for a use; `0` counts as 1. Unset: as said above, with a threshold
+/// of 1 for textures the host writes.
 #[cfg(windows)]
-fn wait_for(resource: usize, handle: u64) {
-    /// A texture with more slots waiting than this is in use for all we
-    /// know (its views are being copied about): its host copy is made.
-    const MOST: usize = 64;
+fn views_make_copy(set: Option<usize>, fills: bool, waiting: usize) -> bool {
+    match set {
+        Some(most) => waiting >= most.max(1),
+        None => !fills && waiting >= 1,
+    }
+}
+
+/// `VICTORY_WAIT_MOST`, if it is set to a number ([`views_make_copy`]).
+#[cfg(windows)]
+fn wait_most() -> Option<usize> {
+    static MOST: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_WAIT_MOST").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+/// The slot at `handle` was written with a view of texture `resource`,
+/// which has no host copy: it waits for one, and the view makes it only as
+/// [`views_make_copy`] says.
+#[cfg(windows)]
+pub(crate) fn wait_for(resource: usize, handle: u64) {
+    let fills = crate::resource::title_fills(resource as This);
     let many = {
         let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
         let slots = waiting.entry(resource).or_default();
         if !slots.contains(&handle) {
             slots.push(handle);
         }
-        slots.len() > MOST
+        views_make_copy(wait_most(), fills, slots.len())
     };
     if many {
         // Makes it, and notes it made.
@@ -1167,6 +1235,9 @@ pub(crate) extern "system" fn copy(
             .collect()
     };
     if dst_starts.is_null() || src_starts.is_null() {
+        if src_ranges > 0 {
+            victory_core::causes::note(victory_core::causes::Cause::DescriptorCopyShort);
+        }
         return;
     }
     let src = ranges(src_ranges, src_starts, src_sizes);
@@ -1175,7 +1246,10 @@ pub(crate) extern "system" fn copy(
     for (mut from, mut left) in src {
         while left > 0 {
             while room == 0 {
-                let Some(next) = dst.next() else { return };
+                let Some(next) = dst.next() else {
+                    victory_core::causes::note(victory_core::causes::Cause::DescriptorCopyShort);
+                    return;
+                };
                 (to, room) = next;
             }
             let n = left.min(room);
@@ -1251,6 +1325,8 @@ pub(crate) extern "system" fn create_heap(
         written: (placed && visible)
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
+        #[cfg(windows)]
+        identity: NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     });
     #[cfg(windows)]
     if visible {
@@ -1292,6 +1368,20 @@ static FUNCTIONS: Table<24> = {
     f[10] = start as *const (); // 0x50 GPU
     Table(f)
 };
+
+/// For tests: a shader-visible view heap of `count` slots.
+#[cfg(all(test, windows))]
+pub(crate) fn test_view_heap(count: u32) -> This {
+    let desc = HeapDesc {
+        kind: VIEWS_KIND,
+        count,
+        flags: SHADER_VISIBLE,
+        nodes: 0,
+    };
+    let mut h = std::ptr::null();
+    assert_eq!(create_heap(std::ptr::null(), &desc, &HEAP_IIDS[0], &mut h), crate::object::S_OK);
+    h
+}
 
 #[cfg(test)]
 mod tests {
@@ -1360,6 +1450,39 @@ mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    /// `release_dynamic` gives a list's dynamic slots back only to the
+    /// title heap they were taken from, by its identity: one kept by a list
+    /// that outlived its heap frees nothing in a heap made later at the
+    /// same address.
+    #[cfg(windows)]
+    #[test]
+    fn release_dynamic_checks_the_heap_identity() {
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let title = heap(h);
+        let Some(host) = title.host() else {
+            release(h);
+            return; // no host GPU
+        };
+        let free = host.free_dynamic();
+        let first = host.dynamic(2).unwrap();
+        release_dynamic(h as usize, title.identity + 1, first, 2);
+        assert_eq!(host.free_dynamic(), free - 2, "a release with another identity gave slots back");
+        release_dynamic(h as usize, title.identity, first, 2);
+        assert_eq!(host.free_dynamic(), free);
+        release(h);
     }
 
     /// A descriptor copied into a placed heap as bytes is mirrored before
@@ -1521,6 +1644,26 @@ mod tests {
         assert_eq!(words(at), words(other.as_ptr() as u64));
         create_cbv(null, &[0x140, 6, 512, 0], other.as_ptr() as u64);
         assert_ne!(words(at), words(other.as_ptr() as u64));
+    }
+
+    /// Views make no host copy of a texture the title fills unless
+    /// `VICTORY_WAIT_MOST` asks for it; of a texture the host writes, on
+    /// the first view; with the switch, at its count for both (0 as 1).
+    #[cfg(windows)]
+    #[test]
+    fn views_make_host_copies_only_of_textures_the_host_writes() {
+        for waiting in [1, 2, 64, 10_000] {
+            assert!(!views_make_copy(None, true, waiting), "a filled texture, {waiting} slots");
+            assert!(views_make_copy(None, false, waiting), "a written texture, {waiting} slots");
+        }
+        assert!(!views_make_copy(None, false, 0));
+        for fills in [true, false] {
+            assert!(!views_make_copy(Some(64), fills, 63));
+            assert!(views_make_copy(Some(64), fills, 64));
+            assert!(views_make_copy(Some(1), fills, 1));
+            assert!(views_make_copy(Some(0), fills, 1));
+            assert!(!views_make_copy(Some(0), fills, 0));
+        }
     }
 
     /// A released resource's views go stale; the same view of a new

@@ -162,6 +162,7 @@ pub extern "system" fn XApuConnect(
     if input.process != DECODE_OPUS {
         // shortcut: rate conversion (decode-convert, PCM convert) is not
         // implemented; add a resampler if a title connects for it.
+        victory_core::causes::note(victory_core::causes::Cause::CallAudioNotImplemented);
         tracing::warn!(
             process = input.process,
             "audio decoder: processing kind not implemented"

@@ -27,8 +27,12 @@ pub fn init(default_level: &str) {
         .with(CAP)
         .with(filter)
         .with(
+            // Colour only on a console: a log redirected to a file keeps
+            // `key=value` as plain text for `victory ab` and `victory report`
+            // (the fmt layer otherwise colours whenever NO_COLOR is unset).
             tracing_subscriber::fmt::layer()
                 .with_target(true)
+                .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
                 .with_writer(std::io::stderr),
         )
         .try_init();

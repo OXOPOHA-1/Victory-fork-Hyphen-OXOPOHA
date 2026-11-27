@@ -104,6 +104,7 @@ pub extern "system" fn serialize(
     };
     static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
     let Some(address) = host_export(&FUNCTION, c"D3D12SerializeRootSignature") else {
+        victory_core::causes::note(victory_core::causes::Cause::CallRootSerialize);
         tracing::warn!("no host d3d12.dll to serialize root signatures");
         return E_NOTIMPL;
     };
@@ -130,6 +131,7 @@ pub extern "system" fn serialize_versioned(
     };
     static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
     let Some(address) = host_export(&FUNCTION, c"D3D12SerializeVersionedRootSignature") else {
+        victory_core::causes::note(victory_core::causes::Cause::CallRootSerialize);
         tracing::warn!("no host d3d12.dll to serialize root signatures");
         return E_NOTIMPL;
     };
@@ -159,6 +161,7 @@ pub extern "system" fn create_deserializer(
     }
     static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
     let Some(address) = host_export(&FUNCTION, c"D3D12CreateRootSignatureDeserializer") else {
+        victory_core::causes::note(victory_core::causes::Cause::CallRootSerialize);
         tracing::warn!("no host d3d12.dll to deserialize root signatures");
         return E_NOTIMPL;
     };
@@ -187,12 +190,30 @@ pub(crate) extern "system" fn create(
     }
     // SAFETY: the title passes `size` bytes.
     let blob = unsafe { std::slice::from_raw_parts(blob, size) }.to_vec();
+    #[cfg(windows)]
+    remember_root(&blob);
     tracing::debug!(size, "root signature");
+    #[cfg(windows)]
+    let capture = crate::device::capture::get();
+    #[cfg(windows)]
+    let saved = capture.map(|c| c.root(&blob));
     let root = Box::new(RootSignature {
         object: Object::new(&FUNCTIONS),
         blob,
     });
-    object::hand_out(ROOT_SIGNATURE, root, iid, &ROOT_SIGNATURE_IIDS, out)
+    let hr = object::hand_out(ROOT_SIGNATURE, root, iid, &ROOT_SIGNATURE_IIDS, out);
+    // With `VICTORY_RAW_SAVE`, remember which object holds which signature,
+    // so that a pipeline description naming the object can name the
+    // signature without reading the object.
+    #[cfg(windows)]
+    if let Some((rts0, whole)) = saved
+        && hr == object::S_OK
+    {
+        // SAFETY: on success `out` holds the object just handed out.
+        let at = unsafe { out.read() } as usize;
+        objects().insert(at, Facts { rts0, blob: whole });
+    }
+    hr
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -200,7 +221,98 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     object::answer(ROOT_SIGNATURE, iid, found, out)
 }
 extern "system" fn release(this: This) -> u32 {
+    #[cfg(windows)]
+    if crate::device::capture::get().is_some() {
+        // Under the lock, so that an object made at the same address after
+        // this one is freed cannot lose its entry.
+        let mut objects = objects();
+        let left = object::release_boxed::<RootSignature>(this);
+        if left == 0 {
+            objects.remove(&(this as usize));
+        }
+        return left;
+    }
     object::release_boxed::<RootSignature>(this)
+}
+
+/// What the capture knows about one of our root signature objects.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Facts {
+    /// The BLAKE3 of its `RTS0` part, if the blob has one.
+    pub(crate) rts0: Option<[u8; 32]>,
+    /// The BLAKE3 of the whole blob.
+    pub(crate) blob: [u8; 32],
+}
+
+/// The live root signature objects by address, kept only while
+/// `VICTORY_RAW_SAVE` is set.
+#[cfg(windows)]
+fn objects() -> std::sync::MutexGuard<'static, std::collections::HashMap<usize, Facts>> {
+    static OBJECTS: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Facts>>> =
+        OnceLock::new();
+    OBJECTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The signature held by our root signature object at `at`, if it is a
+/// live one (known only while `VICTORY_RAW_SAVE` is set).
+#[cfg(windows)]
+pub(crate) fn registered(at: usize) -> Option<Facts> {
+    objects().get(&at).copied()
+}
+
+/// Whether `table` is the function table of our root signature objects:
+/// a word read from an object's first eight bytes.
+pub(crate) fn is_table(table: u64) -> bool {
+    table == FUNCTIONS.0.as_ptr() as u64
+}
+
+/// Whether `bytes` are a serialized root signature: a DXBC container with
+/// an `RTS0` part. Returns `(size, number of RTS0 bytes, known)`, where
+/// `known` says whether this RTS0 is one the title itself created through
+/// `CreateRootSignature`, i.e. the bytes are a real root signature and not a
+/// lookalike. A content test, not a guess from a position in a description.
+#[cfg(windows)]
+pub(crate) fn rts0_in(bytes: &[u8]) -> Option<(usize, usize, bool)> {
+    use victory_shader::{Container, FourCC};
+    let c = Container::parse(bytes).ok()?;
+    let rts0 = c.part(FourCC::RTS0)?;
+    let hash = *blake3::hash(rts0.data).as_bytes();
+    let known = CREATED_ROOTS.get().is_some_and(|set| {
+        set.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&hash)
+    });
+    Some((bytes.len(), rts0.data.len(), known))
+}
+
+/// The RTS0 parts of the root signatures the title actually created. A
+/// blob in a pipeline description that matches one of these is not a guess:
+/// it is the self-same signature the title handed to `create_root_signature`.
+#[cfg(windows)]
+static CREATED_ROOTS: OnceLock<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>> =
+    OnceLock::new();
+
+#[cfg(windows)]
+pub(crate) fn rts0_hash(bytes: &[u8]) -> Option<[u8; 32]> {
+    use victory_shader::{Container, FourCC};
+    let c = Container::parse(bytes).ok()?;
+    let part = c.part(FourCC::RTS0)?;
+    Some(*blake3::hash(part.data).as_bytes())
+}
+
+#[cfg(windows)]
+fn remember_root(bytes: &[u8]) {
+    if let Some(h) = rts0_hash(bytes) {
+        CREATED_ROOTS
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(h);
+    }
 }
 
 /// IUnknown 3, object 4, device child 1.

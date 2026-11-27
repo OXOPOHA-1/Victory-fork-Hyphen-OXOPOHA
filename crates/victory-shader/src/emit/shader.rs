@@ -73,6 +73,8 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// UAVs in a stage other than pixel and compute (amplification).
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
@@ -95,6 +97,23 @@ pub(crate) struct Types {
     pub bind: Ty,
     pub cbuf_ret: Ty,
     pub res_ret: Ty,
+}
+
+thread_local! {
+    /// The payload bytes mesh shaders finished on this thread declare
+    /// ([`with_mesh_payload`]).
+    static MESH_PAYLOAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `f` with mesh shaders declaring a payload of `bytes` (0 outside):
+/// the form that runs behind an amplification stage, which must hand its
+/// mesh groups a payload of the same size (D3D12 mesh shader
+/// specification, "DispatchMesh intrinsic"). The shader does not read it.
+pub(crate) fn with_mesh_payload<T>(bytes: u32, f: impl FnOnce() -> T) -> T {
+    let before = MESH_PAYLOAD.replace(bytes);
+    let out = f();
+    MESH_PAYLOAD.set(before);
+    out
 }
 
 /// What a mesh shader declares beyond its thread-group size.
@@ -142,6 +161,10 @@ pub(crate) struct Shader {
     pub mesh: Option<Mesh>,
     /// A geometry shader (the rectangle stage, `rect.rs`); `pixel` is false.
     pub geometry: Option<Geometry>,
+    /// An amplification shader (the mesh launch stage, `amplify.rs`) and
+    /// the bytes of the payload it hands its mesh groups; `threads` is its
+    /// thread-group size.
+    pub amplification: Option<u32>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -205,6 +228,7 @@ impl Shader {
             prims: Vec::new(),
             mesh: None,
             geometry: None,
+            amplification: None,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
@@ -640,7 +664,7 @@ impl Shader {
             self.m.named_md("dx.resources", vec![r]);
         }
 
-        let graphics = self.threads.is_none() || self.mesh.is_some();
+        let graphics = (self.threads.is_none() || self.mesh.is_some()) && self.amplification.is_none();
         if graphics {
             // shortcut: every output is declared to depend on every input; the
             // exact sets need a dependence pass. Drivers read this state.
@@ -711,6 +735,13 @@ impl Shader {
             let t = threads.map(|n| Some(i32c(&mut self, n)));
             let t = self.m.md_node(t.to_vec());
             match self.mesh {
+                // Amplification state (tag 10): threads, payload bytes.
+                None if self.amplification.is_some() => {
+                    props.push(i32c(&mut self, 10));
+                    let bytes = self.amplification.unwrap_or(0);
+                    let payload = Some(i32c(&mut self, bytes));
+                    props.push(self.m.md_node(vec![Some(t), payload]));
+                }
                 // Mesh state (tag 9): threads, maximum vertices and
                 // primitives, topology, payload bytes.
                 Some(mesh) => {
@@ -719,7 +750,7 @@ impl Shader {
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        0,
+                        MESH_PAYLOAD.get(),
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];
@@ -753,8 +784,10 @@ impl Shader {
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
         self.m.named_md("dx.valver", vec![version]);
-        // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
+        // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh,
+        // 14 amplification.
         let (name, kind) = match (self.threads, self.pixel) {
+            _ if self.amplification.is_some() => ("as", 14u32),
             _ if self.mesh.is_some() => ("ms", 13u32),
             _ if self.geometry.is_some() => ("gs", 2),
             (Some(_), _) => ("cs", 5u32),
@@ -783,6 +816,9 @@ impl Shader {
         }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
+        }
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
@@ -822,8 +858,9 @@ impl Shader {
             inputs: &self.inputs,
             outputs: &self.outputs,
             prims: &self.prims,
-            mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            mesh: self.mesh.map(|m| (m, self.lds_dwords * 4, MESH_PAYLOAD.get())),
             geometry: self.geometry.map(|g| g.max_vertices),
+            amplification: self.amplification,
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,

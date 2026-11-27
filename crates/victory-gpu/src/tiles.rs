@@ -71,6 +71,37 @@ const HEAP_TILES: u32 = 1024;
 /// no heap could be had); uploads recorded again for such a level.
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
+/// Textures that show no level (every view reads zeros, a black texture),
+/// the bytes their levels would take, and levels given tiles on a full card
+/// by [`Tiled::small_levels`].
+pub(crate) static BLANK: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// A full card need not mean a black texture: while there is a budget, give
+/// tiles to the smallest held mip of an upload so a view shows a blurred
+/// level instead of zeros. `VICTORY_TILES_SMALL_WHEN_FULL_MB`, 128 MB by
+/// default (at most 1024): the bytes of tiles given this way and held at
+/// once ([`SMALL_GIVEN`]); `=0` turns it off. A blurred level is worth far
+/// more than the black squares a title that streams textures otherwise
+/// shows. It applies to textures made level by level
+/// (`VICTORY_LEVELS_ON_DEMAND=1`).
+fn small_when_full_mb() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_TILES_SMALL_WHEN_FULL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(128)
+            .min(1024)
+    })
+}
+
+/// Cap on the tiles one texture gets this way; enough for a small mip.
+const SMALL_TILES: u32 = 16;
+
+/// The bytes of the tiles given on a full card by [`Tiled::small_levels`]
+/// and held now: what [`small_when_full_mb`] caps (not all tiles given).
+static SMALL_GIVEN: AtomicU64 = AtomicU64::new(0);
+
 /// Whether textures are made this way: the switch
 /// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
 /// zeros from, and drops writes to, levels without memory (tiled resources
@@ -172,6 +203,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
             let mut made: Option<ID3D12Heap> = None;
             // SAFETY: plain creation; the out pointer is ours.
             if let Err(e) = unsafe { device.CreateHeap::<ID3D12Heap>(&raw const desc, &raw mut made) } {
+                victory_core::causes::note(victory_core::causes::Cause::TilesNoHeap);
                 tracing::warn!(error = %e, "no heap for texture levels given on demand: those levels stay empty");
                 return None;
             }
@@ -245,6 +277,8 @@ struct Given {
     packed: bool,
     /// The runs taken: the heap's place, first tile, tiles.
     runs: Vec<(usize, u32, u32)>,
+    /// The bytes of those given on a full card ([`SMALL_GIVEN`]).
+    small: u64,
 }
 
 /// A host texture made without memory, and the tiles its levels have been
@@ -323,11 +357,15 @@ impl Tiled {
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(full, Ordering::Relaxed);
         STATS[4].fetch_add(1, Ordering::Relaxed);
+        // Made with no level shown: every view of it reads zeros for now.
+        BLANK[0].fetch_add(1, Ordering::Relaxed);
+        BLANK[1].fetch_add(full, Ordering::Relaxed);
         Some(Tiled {
             given: Mutex::new(Given {
                 levels: vec![false; standard.len()],
                 packed: false,
                 runs: Vec::new(),
+                small: 0,
             }),
             standard,
             packed: packed_tiles,
@@ -378,9 +416,53 @@ impl Tiled {
         let named = held | card;
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        // A full card denies tiles to held levels. Give the smallest held
+        // ones a few tiles first so the texture shows a blurred level rather
+        // than black; the larger levels still wait for room.
+        let small = if room { 0 } else { self.small_levels(held) };
+        BLANK[2].fetch_add(u64::from(small.count_ones()), Ordering::Relaxed);
+        let changed = self.give_locked(
+            &mut given,
+            queue,
+            device,
+            texture,
+            named,
+            if room { named } else { card | small },
+            small & !card,
+        );
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
+    }
+
+    /// Bits of the smallest held levels that may get tiles on a full card.
+    /// The packed levels come first; then standard levels from the smallest
+    /// up. The run is contiguous from the smallest level so the first level
+    /// a view shows never has a hole without memory beneath it.
+    fn small_levels(&self, held: u32) -> u32 {
+        let cap = small_when_full_mb() << 20;
+        if cap == 0 || SMALL_GIVEN.load(Ordering::Relaxed) >= cap {
+            return 0;
+        }
+        let first_packed = self.standard.len() as u32;
+        let mut bits = 0u32;
+        let mut tiles = 0u32;
+        if self.packed > 0 {
+            let packed_bits = self.every_level() & !((1u32 << first_packed) - 1);
+            if held & packed_bits == 0 {
+                return 0;
+            }
+            bits |= packed_bits;
+            tiles += self.packed;
+        }
+        for level in (0..first_packed).rev() {
+            let here = self.standard[level as usize];
+            if held & (1 << level) == 0 || tiles + here > SMALL_TILES {
+                break;
+            }
+            tiles += here;
+            bits |= 1 << level;
+        }
+        if tiles > SMALL_TILES { 0 } else { bits }
     }
 
     /// At the submission of a list in which the card itself writes the
@@ -415,6 +497,7 @@ impl Tiled {
             texture,
             prev | levels | self.held.load(Ordering::Relaxed),
             levels,
+            0,
         );
         // Only levels that actually received tiles (or already had them) saw
         // the card's write; a level that got no tiles saw its zeros and write
@@ -504,9 +587,12 @@ impl Tiled {
         may: u32,
     ) -> bool {
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
-        self.give_locked(&mut given, queue, device, texture, named, may)
+        self.give_locked(&mut given, queue, device, texture, named, may, 0)
     }
 
+    /// `small`: the levels of `may` given only because the card is full
+    /// ([`Tiled::small_levels`]); their bytes count in [`SMALL_GIVEN`].
+    #[allow(clippy::too_many_arguments)] // the lock's guard, the objects it needs, and what to give
     fn give_locked(
         &self,
         given: &mut Given,
@@ -515,6 +601,7 @@ impl Tiled {
         texture: &ID3D12Resource,
         named: u32,
         may: u32,
+        small: u32,
     ) -> bool {
         let has = |level: u32| level < 32 && named & (1 << level) != 0;
         let now = |level: u32| level < 32 && named & may & (1 << level) != 0;
@@ -569,6 +656,14 @@ impl Tiled {
             }
             STATS[6].fetch_add(1, Ordering::Relaxed);
             STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let by_small = match level {
+                Some(level) => small & (1 << level) != 0,
+                None => (first_packed..self.levels).any(|l| l < 32 && small & (1 << l) != 0),
+            };
+            if by_small {
+                given.small += u64::from(tiles) * TILE;
+                SMALL_GIVEN.fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
+            }
             match level {
                 Some(level) => given.levels[level] = true,
                 None => given.packed = true,
@@ -587,7 +682,16 @@ impl Tiled {
             }
         };
         let shown = (0..self.levels).find(|&level| has(level) && with_tiles(level)).unwrap_or(u32::MAX);
-        self.shown.swap(shown, Ordering::Relaxed) != shown
+        let old = self.shown.swap(shown, Ordering::Relaxed);
+        // The blank count is under `given`'s lock: one mover at a time.
+        if old == u32::MAX && shown != u32::MAX {
+            BLANK[0].fetch_sub(1, Ordering::Relaxed);
+            BLANK[1].fetch_sub(self.full, Ordering::Relaxed);
+        } else if old != u32::MAX && shown == u32::MAX {
+            BLANK[0].fetch_add(1, Ordering::Relaxed);
+            BLANK[1].fetch_add(self.full, Ordering::Relaxed);
+        }
+        old != shown
     }
 
     /// The first level a view of the texture may show; `None` while no
@@ -642,6 +746,11 @@ impl Drop for Tiled {
         STATS[0].fetch_sub(1, Ordering::Relaxed);
         STATS[1].fetch_sub(self.full, Ordering::Relaxed);
         STATS[2].fetch_sub(bytes, Ordering::Relaxed);
+        SMALL_GIVEN.fetch_sub(given.small, Ordering::Relaxed);
+        if *self.shown.get_mut() == u32::MAX {
+            BLANK[0].fetch_sub(1, Ordering::Relaxed);
+            BLANK[1].fetch_sub(self.full, Ordering::Relaxed);
+        }
     }
 }
 
@@ -709,6 +818,16 @@ pub(crate) fn status() {
         s[7],
         s[9],
         s[10],
+    );
+    let blank: Vec<u64> = BLANK.iter().map(|b| b.load(Ordering::Relaxed)).collect();
+    tracing::info!(
+        "textures that show no level (every view reads zeros, a black texture): {} of {} alive, {} MB if all \
+         their levels had memory; levels given tiles on a full card (VICTORY_TILES_SMALL_WHEN_FULL_MB={}): {}",
+        blank[0],
+        s[0],
+        blank[1] >> 20,
+        small_when_full_mb(),
+        blank[2],
     );
 }
 
@@ -1563,6 +1682,7 @@ void look() {
                 levels: vec![false, false],
                 packed: false,
                 runs: Vec::new(),
+                small: 0,
             }),
             shown: AtomicU32::new(u32::MAX),
             held: AtomicU32::new(0),
@@ -1579,8 +1699,16 @@ void look() {
         // that does not hold level 0 must not treat level 0 as card-owned.
         tiled.standard[0] = 1;
         let (changed, waiting) = tiled.uploaded_on(host.queue(), &host.device, &tex, 1 << 1, false);
-        assert!(!changed && waiting);
+        // On a full card the smallest held level may get a few tiles, so a
+        // view shows a blurred level instead of black. The level that is not
+        // held still gets none, and no tile is taken when the switch is off.
+        if small_when_full_mb() == 0 {
+            assert!(!changed && waiting);
+            assert_eq!(tiled.given_bytes(), 0);
+        } else {
+            assert!(changed && !waiting);
+            assert_eq!(tiled.given_bytes(), TILE);
+        }
         assert!(!tiled.has_tiles(0));
-        assert_eq!(tiled.given_bytes(), 0);
     }
 }

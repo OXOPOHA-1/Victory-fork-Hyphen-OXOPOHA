@@ -162,6 +162,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
             ordinal = name as usize,
             "GetProcAddress by ordinal"
         );
+        victory_core::causes::note(victory_core::causes::Cause::CallGetProcAddress);
         return std::ptr::null_mut();
     }
     // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
@@ -169,6 +170,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     match m.exports.iter().find(|e| e.name == name) {
         Some(e) => e.address as *mut c_void,
         None => {
+            victory_core::causes::note(victory_core::causes::Cause::CallGetProcAddress);
             tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
             std::ptr::null_mut()
         }
@@ -233,12 +235,14 @@ pub extern "system" fn OutputDebugStringW(text: *const u16) {
 /// the code and the caller, then exits on the host.
 pub extern "C" fn exit(code: i32) -> ! {
     tracing::warn!(code, from = %host::callers(), "title exits");
+    victory_core::causes::log_summary();
     host::exit(code)
 }
 
 /// The CRT's `abort` (also reached from `terminate`): logged like [`exit`].
 pub extern "C" fn abort() -> ! {
     tracing::error!(from = %host::callers(), "title aborts");
+    victory_core::causes::log_summary();
     host::abort()
 }
 
@@ -246,12 +250,14 @@ pub extern "C" fn abort() -> ! {
 /// the host's `abort`.
 pub extern "C" fn terminate() -> ! {
     tracing::error!(from = %host::callers(), "title calls terminate");
+    victory_core::causes::log_summary();
     host::abort()
 }
 
 /// See [`terminate`].
 pub extern "C" fn _invalid_parameter_noinfo_noreturn() -> ! {
     tracing::error!(from = %host::callers(), "title passed an invalid parameter");
+    victory_core::causes::log_summary();
     host::abort()
 }
 
@@ -266,6 +272,8 @@ pub extern "system" fn SetUnhandledExceptionFilter(filter: usize) -> usize {
 
 extern "system" fn report_unhandled(info: *const c_void) -> i32 {
     host::report_unhandled(info);
+    // The run usually ends here: what was not done up to the crash.
+    victory_core::causes::log_summary();
     match TITLE_FILTER.load(std::sync::atomic::Ordering::Acquire) {
         0 => 0, // EXCEPTION_CONTINUE_SEARCH
         filter => {
@@ -281,6 +289,7 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
 pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
     if process as isize == -1 {
         tracing::warn!(code, from = %host::callers(), "title terminates the process");
+        victory_core::causes::log_summary();
     }
     host::terminate_process(process, code)
 }
@@ -341,6 +350,7 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
 fn refuse(file: &str) {
     static REFUSED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let file = file.to_ascii_lowercase();
+    victory_core::causes::note(victory_core::causes::Cause::CallHostDllRefused);
     let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
     if !refused.contains(&file) {
         tracing::warn!(dll = file, "a host DLL outside the host policy: refused");

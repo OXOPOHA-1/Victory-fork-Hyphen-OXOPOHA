@@ -210,6 +210,11 @@ fn run_cases(
     run_cases_on(shader, cases, &[("hardware", false), ("warp", true)], check);
 }
 
+/// The running test's name (the test harness names each test's thread after it).
+pub(super) fn this_test() -> String {
+    std::thread::current().name().unwrap_or("a test").to_owned()
+}
+
 fn run_cases_on(
     shader: &HostShader,
     cases: &[[u32; 4]],
@@ -220,7 +225,7 @@ fn run_cases_on(
     let mut ran = 0;
     for &(label, warp) in devices {
         let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+            super::host::skipped(&this_test(), &format!("no SM 6.6 {label} device"));
             continue;
         };
         let (root, pso) = host
@@ -253,7 +258,7 @@ fn run_cases_on(
     }
     if ran == 0 && devices.iter().all(|&(_, warp)| !warp) {
         // A case for the hardware adapter alone, on a machine without one.
-        eprintln!("no SM 6.6 hardware device; a hardware-only case not run");
+        super::host::skipped(&this_test(), "no SM 6.6 hardware device for a hardware-only case");
         return;
     }
     assert!(ran > 0, "no SM 6.6 device available ({devices:?})");
@@ -1584,7 +1589,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
             Ok(p) => p,
             // WARP does not support fixed WaveSize(32) on SM 6.6.
             Err(e) if warp => {
-                eprintln!("{label}: compute_pipeline skipped ({e})");
+                super::host::skipped(&this_test(), &format!("{label} refused the pipeline: {e}"));
                 continue;
             }
             Err(e) => panic!("{label}: compute_pipeline failed: {e}"),

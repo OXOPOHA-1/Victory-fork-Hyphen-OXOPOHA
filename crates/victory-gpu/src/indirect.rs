@@ -34,6 +34,8 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
@@ -973,6 +975,243 @@ pub(crate) fn check_hit(
     true
 }
 
+/// Whether indirect mesh draws launch through the layer's amplification
+/// stage instead of the clamp pass (`VICTORY_MESH_AMPLIFY`; on unless it is
+/// `0`). The clamp pass put a compute pass of ours and two waits for all
+/// earlier shader work in front of every indirect mesh draw, thousands a
+/// frame; the console has no such step. With the stage, the draw's record
+/// is read, clamped and charged to the list's budget by the stage in
+/// front of the translated mesh shader (`victory_shader::emit::mesh_launch_as`)
+/// and the draw is one `DispatchMesh(1, 1, 1)`: the same mesh groups with
+/// the same group ids, no pass, no wait (a wait for earlier shader writes
+/// only when something that may store ran since the last one). Draws it
+/// cannot take exactly get the clamp pass and are counted by why
+/// ([`MESH_FALLBACK`]). `0` keeps the clamp pass for every indirect mesh
+/// draw: no second form of mesh pipelines, no second translation of mesh
+/// shaders.
+///
+/// Also off with `VICTORY_INDIRECT_CARD_BUDGET=0`: the budget words are
+/// then in memory the CPU maps, and the draws' turn ([`fallback::MAPPED_BUDGET`])
+/// is slower there than the clamp pass.
+pub(crate) fn mesh_amplify_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| switch_on("VICTORY_MESH_AMPLIFY") && switch_on("VICTORY_INDIRECT_CARD_BUDGET"))
+}
+
+/// Whether the switch `name` is unset or anything but `0`.
+fn switch_on(name: &str) -> bool {
+    std::env::var_os(name).is_none_or(|v| v != "0")
+}
+
+/// [`mesh_amplify_wanted`] on a card with mesh shaders (tier 1 covers
+/// amplification shaders; `Host::mesh_shaders`).
+pub(crate) fn mesh_amplify() -> bool {
+    mesh_amplify_wanted() && host().is_some_and(|h| h.mesh_shaders())
+}
+
+/// The start-up line about [`mesh_amplify`], for a card with mesh shaders
+/// or without (`mesh`).
+pub(crate) fn mesh_amplify_start_line(mesh: bool) -> String {
+    if !switch_on("VICTORY_MESH_AMPLIFY") {
+        return "mesh launch through amplification: OFF (VICTORY_MESH_AMPLIFY=0: every indirect mesh draw has a clamp pass in front)".to_owned();
+    }
+    if !switch_on("VICTORY_INDIRECT_CARD_BUDGET") {
+        return "mesh launch through amplification: OFF (VICTORY_INDIRECT_CARD_BUDGET=0 keeps the lists' budget words in memory the CPU maps, where the stage's turn is slower than the clamp pass: every indirect mesh draw has a clamp pass in front)"
+            .to_owned();
+    }
+    // Both switches are on here, so `mesh_amplify_wanted()` is too.
+    if mesh {
+        "mesh launch through amplification: ON (indirect mesh draws are launched by the layer's amplification stage, \
+         without a clamp pass; VICTORY_MESH_AMPLIFY=0 goes back to the clamp pass)"
+            .to_owned()
+    } else {
+        "mesh launch through amplification: OFF (the card has no mesh shaders, so no amplification stage either)".to_owned()
+    }
+}
+
+/// The stage (`victory_shader::emit::mesh_launch_as`), made once.
+pub(crate) fn mesh_launch_stage() -> Option<&'static [u8]> {
+    static STAGE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    STAGE
+        .get_or_init(|| match std::panic::catch_unwind(victory_shader::emit::mesh_launch_as) {
+            Ok(stage) => Some(stage),
+            Err(_) => {
+                tracing::warn!("the mesh launch stage could not be made: indirect mesh draws take the clamp pass");
+                None
+            }
+        })
+        .as_deref()
+}
+
+/// Indirect mesh draws since the last mesh launch line: launched through
+/// the stage, through the clamp pass, and the waits for earlier shader
+/// writes recorded in front of stage draws.
+pub(crate) static MESH_LAUNCHES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Why indirect mesh draws took the clamp pass with the stage on, since
+/// the last mesh launch line (the names in [`MESH_FALLBACK_WHY`]).
+pub(crate) static MESH_FALLBACK: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// [`MESH_FALLBACK`]'s reasons.
+pub(crate) const MESH_FALLBACK_WHY: [&str; 6] = [
+    "the pipeline has no form with the stage",
+    "a command of other than one record",
+    "a record or count the stage cannot read (stride under 12 or not 4-byte aligned)",
+    "no budget words for the list",
+    "the host list has no mesh dispatch",
+    "the list's budget words are in memory the CPU maps (VICTORY_INDIRECT_CARD_BUDGET=0, or no copy on the card)",
+];
+
+/// Fallback reasons, as [`MESH_FALLBACK`] indices.
+pub(crate) mod fallback {
+    pub(crate) const NO_FORM: usize = 0;
+    pub(crate) const RECORDS: usize = 1;
+    pub(crate) const LAYOUT: usize = 2;
+    pub(crate) const NO_BUDGET: usize = 3;
+    pub(crate) const NO_MESH_LIST: usize = 4;
+    /// Each draw reads the turn with atomics until its turn comes: in
+    /// mapped memory every one crosses the bus (on the Arc B580 a draw took
+    /// 90 microseconds so, against 9 with the clamp pass; in the card's
+    /// memory 0.6).
+    pub(crate) const MAPPED_BUDGET: usize = 5;
+}
+
+/// The cause of a [`MESH_FALLBACK`] reason.
+pub(crate) fn fallback_cause(reason: usize) -> victory_core::causes::Cause {
+    use victory_core::causes::Cause;
+    match reason {
+        fallback::NO_FORM => Cause::MeshClampNoForm,
+        fallback::RECORDS => Cause::MeshClampRecords,
+        fallback::LAYOUT => Cause::MeshClampLayout,
+        fallback::NO_BUDGET => Cause::MeshClampNoBudget,
+        fallback::NO_MESH_LIST => Cause::MeshClampNoMeshList,
+        _ => Cause::MeshClampMappedBudget,
+    }
+}
+
+/// What the stage counted on the card, from the lists' budget words (a run
+/// late): draws that charged out of turn (after
+/// `victory_shader::emit::MESH_LAUNCH_TURN_LIMIT` reads of the turn; no
+/// charge is lost then, only their order may differ from the list's, so
+/// the budget words are the clamp's and which records run empty differs
+/// from the clamp's only in a list whose budget ran out), records clamped
+/// (x over 65,535, y or z over 1), records left empty by the budget.
+pub(crate) static MESH_STAGE_COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The byte offsets of the budget words a list zeroes: the clamp's three,
+/// then, with [`mesh_amplify`], the stage's (turn, late, clamped, emptied).
+pub(crate) fn budget_words() -> &'static [u64] {
+    if mesh_amplify_wanted() { &[0, 4, 8, 12, 16, 20, 24] } else { &[0, 4, 8] }
+}
+
+/// Takes the stage's counts from a list's mapped budget words (`words`, at
+/// least seven) after its run.
+///
+/// # Safety
+/// `words` points at the list's mapped budget words, which no run uses.
+pub(crate) unsafe fn take_stage_words(words: *const u32) {
+    if !mesh_amplify_wanted() {
+        return;
+    }
+    for (k, counter) in MESH_STAGE_COUNTS.iter().enumerate() {
+        // SAFETY: as the caller says.
+        let n = unsafe { words.add(4 + k).read_volatile() };
+        counter.fetch_add(u64::from(n), Ordering::Relaxed);
+        use victory_core::causes::Cause;
+        const CAUSES: [Cause; 3] = [Cause::MeshOutOfTurn, Cause::MeshRecordsClamped, Cause::IndirectClampEmptied];
+        victory_core::causes::note_n(CAUSES[k], u64::from(n));
+    }
+}
+
+/// When the next mesh launch line is due (`crate::host::now_ms`), and when
+/// the last one was.
+static MESH_LINE_AT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Every five seconds or more while indirect mesh draws run, one line with
+/// [`MESH_LAUNCHES`], [`MESH_FALLBACK`] by why, [`MESH_STAGE_COUNTS`], and
+/// the title's amplification stages refused. Costs a clock read when no
+/// line is due.
+pub(crate) fn mesh_launch_line() {
+    let now = crate::host::now_ms().max(1);
+    let next = MESH_LINE_AT[0].load(Ordering::Relaxed);
+    if now < next || MESH_LINE_AT[0].compare_exchange(next, now + 5000, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let since = MESH_LINE_AT[1].swap(now, Ordering::Relaxed);
+    if next == 0 {
+        return;
+    }
+    let take = |c: &AtomicU64| c.swap(0, Ordering::Relaxed);
+    let [amplified, clamped_pass, waits] = MESH_LAUNCHES.each_ref().map(take);
+    let fallbacks: Vec<String> = MESH_FALLBACK
+        .iter()
+        .zip(MESH_FALLBACK_WHY)
+        .filter_map(|(c, why)| {
+            let n = take(c);
+            (n > 0).then(|| format!("{n} for {why}"))
+        })
+        .collect();
+    let [late, clamps, emptied] = MESH_STAGE_COUNTS.each_ref().map(take);
+    let no_form = crate::pipeline::host::NO_AMPLIFIED_FORM.each_ref().map(|c| c.load(Ordering::Relaxed));
+    let title = crate::pipeline::host::TITLE_AMPLIFICATION.each_ref().map(|c| c.load(Ordering::Relaxed));
+    tracing::info!(
+        "mesh launch over {:.1} s: {amplified} indirect mesh draws launched through the amplification stage ({waits} waits for \
+         earlier shader writes in front of them), {clamped_pass} through the clamp pass{}; on the card: {clamps} records clamped, \
+         {emptied} left empty by the list's budget, {late} charged out of turn (0: the budget was charged in list order, as the \
+         clamp pass charges it); since the start: mesh pipelines without a form with the stage: {} whose mesh shader does not \
+         translate for it, {} whose root signature is refused, {} refused, {} for want of the stage; title pipelines with an \
+         amplification stage (kind 23): {} made by the title, {} of them refused here (not translated)",
+        now.saturating_sub(since) as f64 / 1000.0,
+        if fallbacks.is_empty() { String::new() } else { format!(" ({})", fallbacks.join(", ")) },
+        no_form[0],
+        no_form[1],
+        no_form[2],
+        no_form[3],
+        title[0],
+        title[1],
+    );
+}
+
+/// Records the stage's part of an indirect mesh draw in `list`, whose
+/// graphics root signature and pipeline are the form with the stage
+/// (`HostPipeline::amplified`, root parameters from `params` on): the
+/// ticket and flags, the record at `record`, the count at `count` (or
+/// none), the budget words at `budget`; then the launch. The caller has
+/// checked the addresses ([`launchable`]).
+pub(crate) fn record_launch(
+    list: &ID3D12GraphicsCommandList6,
+    params: u32,
+    ticket: u32,
+    (record, count): (u64, Option<u64>),
+    budget: u64,
+) {
+    let flags = if count.is_some() { victory_shader::emit::MESH_LAUNCH_FLAG_COUNT } else { 0 };
+    let words = [ticket, flags];
+    // SAFETY: an open list with the form's root signature set; the views
+    // name live buffers the list keeps.
+    unsafe {
+        list.SetGraphicsRoot32BitConstants(params, 2, words.as_ptr().cast(), 0);
+        list.SetGraphicsRootShaderResourceView(params + 1, record);
+        list.SetGraphicsRootShaderResourceView(params + 2, count.unwrap_or(record));
+        list.SetGraphicsRootUnorderedAccessView(params + 3, budget);
+        list.DispatchMesh(1, 1, 1);
+    }
+}
+
+/// Whether the stage can read a mesh record `stride` bytes apart at the
+/// card address `record`, with its count at `count`: what the clamp asks
+/// of them, and a whole record.
+pub(crate) fn launchable(stride: u32, record: u64, count: Option<u64>) -> bool {
+    stride >= 12 && stride.is_multiple_of(4) && record.is_multiple_of(4) && count.is_none_or(|c| c.is_multiple_of(4))
+}
+
+/// A wait for every earlier shader write (the title's argument passes)
+/// before a stage draw reads its record, as the clamp's first wait.
+pub(crate) fn wait_for_writes(list: &ID3D12GraphicsCommandList) {
+    // SAFETY: an open list.
+    unsafe { list.ResourceBarrier(&[uav_barrier()]) };
+}
+
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -1016,11 +1255,21 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        /// The adapter's name, with its vendor and device numbers and its
+        /// DXGI flags, so a test's line says which adapter it ran on.
+        adapter: String,
+        /// The adapter is a software one: it runs shader threads as CPU
+        /// threads the system schedules. That is an adapter with DXGI's
+        /// software flag, or any adapter of vendor 0x1414 (Microsoft:
+        /// WARP, the Basic Render Driver, and the display adapters of a
+        /// virtual machine or a remote session, which DXGI lists without
+        /// that flag and which have no graphics card behind them).
+        software: bool,
     }
 
     impl WarpHarness {
         fn new() -> Option<Self> {
-            // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
+            // SAFETY: plain DXGI WARP query.
             unsafe {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
@@ -1029,8 +1278,40 @@ void main() {
                 if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
                     return None;
                 }
+                Self::on(&adapter)
+            }
+        }
+
+        /// The harness on a card with mesh shaders: the system's default
+        /// adapter (the one the layer takes), else the software one if it
+        /// has them. None when neither has. `VICTORY_TEST_ADAPTER=warp`
+        /// takes only the software one, as a machine without a card (the
+        /// CI runner) does.
+        fn card() -> Option<Self> {
+            let warp_only = std::env::var_os("VICTORY_TEST_ADAPTER").is_some_and(|v| v.eq_ignore_ascii_case("warp"));
+            // SAFETY: plain DXGI queries.
+            let adapters: Vec<IDXGIAdapter> = unsafe {
+                let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+                let default = if warp_only { None } else { factory.EnumAdapters(0).ok() };
+                [default, factory.EnumWarpAdapter().ok()].into_iter().flatten().collect()
+            };
+            adapters.iter().filter_map(Self::on).find(|h| {
+                let mut o7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+                // SAFETY: the query writes its own structure.
+                let ok = unsafe { h.device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, (&raw mut o7).cast(), size_of_val(&o7) as u32) };
+                ok.is_ok() && o7.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
+            })
+        }
+
+        fn on(adapter: &IDXGIAdapter) -> Option<Self> {
+            // SAFETY: plain D3D12 test harness setup.
+            unsafe {
+                let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
+                let name = String::from_utf16_lossy(&desc.Description).trim_end_matches('\0').to_owned();
+                let name = format!("{name} (vendor {:04x}, device {:04x}, flags {:#x})", desc.VendorId, desc.DeviceId, desc.Flags);
+                let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || desc.VendorId == 0x1414;
                 let mut device: Option<ID3D12Device> = None;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+                D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
                 let device = device?;
                 let queue: ID3D12CommandQueue = device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
@@ -1058,6 +1339,8 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    adapter: name,
+                    software,
                 })
             }
         }
@@ -2478,6 +2761,678 @@ void main() {
             // SAFETY: the list has run; a mapped buffer.
             let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
             assert_eq!(hits, expected, "every record of both windows runs once");
+        }
+    }
+
+    /// The mesh launch stage against the clamp pass, on a card with mesh
+    /// shaders (the hardware adapter; the software one if it has them):
+    /// the same indirect mesh draws, once with the clamp pass and
+    /// `ExecuteIndirect` as `crate::draw` records them with
+    /// `VICTORY_MESH_AMPLIFY=0`, once with the stage and `DispatchMesh(1,
+    /// 1, 1)` as it records them by default. Each mesh group draws one
+    /// pixel of a render target, at a place given by its draw and its
+    /// group id (`SV_GroupID.x`), adding 1 there, plus 1000 if its group
+    /// id has a y or z; so the target read back holds, per draw, exactly
+    /// the set of groups that ran and how often. The two targets, and the
+    /// budget words, must be equal byte for byte, and equal to what the
+    /// clamp's rules give (`victory_shader::emit::mesh_launch`).
+    /// What the stage asks of a record's place, as the clamp asks it.
+    #[test]
+    fn mesh_records_the_stage_can_read() {
+        assert!(launchable(12, 0x1000, None));
+        assert!(launchable(16, 0x1004, Some(0x2008)));
+        assert!(!launchable(8, 0x1000, None), "shorter than a mesh record");
+        assert!(!launchable(14, 0x1000, None), "a stride off four bytes");
+        assert!(!launchable(12, 0x1002, None), "a record off four bytes");
+        assert!(!launchable(12, 0x1000, Some(0x2001)), "a count off four bytes");
+    }
+
+    /// With no switch set (as the tests run): on where the card has mesh
+    /// shaders, off and why where it has not.
+    #[test]
+    fn the_mesh_launch_start_up_line() {
+        if std::env::var_os("VICTORY_MESH_AMPLIFY").is_some() || std::env::var_os("VICTORY_INDIRECT_CARD_BUDGET").is_some() {
+            eprintln!("SKIPPED (cargo counts it as passed): the_mesh_launch_start_up_line: a switch it reads is set");
+            return;
+        }
+        assert!(mesh_amplify_start_line(true).starts_with("mesh launch through amplification: ON ("));
+        assert!(mesh_amplify_start_line(false).starts_with("mesh launch through amplification: OFF (the card has no mesh shaders"));
+        assert_eq!(budget_words(), &[0, 4, 8, 12, 16, 20, 24]);
+    }
+
+    mod mesh_launch {
+        use super::*;
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT;
+        use std::path::{Path, PathBuf};
+        use victory_shader::emit::{MESH_LAUNCH_BUDGET as BUDGET, mesh_launch};
+
+        /// Where the draws' pixels go: 256 wide, `rows` rows a draw.
+        const WIDTH: u32 = 256;
+        /// Bytes between records in the argument buffer (the stride).
+        const STRIDE: u32 = 16;
+
+        const MS_PLAIN: &str = "
+            struct V { float4 p : SV_Position; nointerpolation uint v : V; };
+            cbuffer C : register(b0, space9) { uint draw; uint rows; uint height; };
+            [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
+            void main(uint3 gid : SV_GroupID, out vertices V v[3], out indices uint3 t[1]) {
+                SetMeshOutputCounts(3, 1);
+                uint px = gid.x % 256;
+                uint py = draw * rows + gid.x / 256;
+                float2 c = float2((px + 0.5) / 256.0 * 2.0 - 1.0, 1.0 - (py + 0.5) / height * 2.0);
+                float2 d = float2(0.8 / 256.0, 0.8 / height);
+                uint value = 1 + ((gid.y | gid.z) != 0 ? 1000 : 0);
+                v[0].p = float4(c.x - d.x, c.y - d.y, 0, 1);
+                v[1].p = float4(c.x + d.x, c.y - d.y, 0, 1);
+                v[2].p = float4(c.x, c.y + d.y, 0, 1);
+                v[0].v = value; v[1].v = value; v[2].v = value;
+                t[0] = uint3(0, 1, 2);
+            }";
+        const PS: &str = "
+            float4 main(float4 p : SV_Position, nointerpolation uint v : V) : SV_Target { return float4(v, 0, 0, 0); }";
+        /// A title argument pass: one record written by the card.
+        const WRITER_CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0)"
+cbuffer W : register(b0) { uint at; uint x; uint y; uint z; };
+RWByteAddressBuffer args : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() { args.Store3(at, uint3(x, y, z)); }
+"#;
+
+        /// The mesh shader behind the stage: the same, taking its payload
+        /// (unread), as `victory_shader::emit::translate_amplified` makes
+        /// the translated ones.
+        fn ms_amplified() -> String {
+            MS_PLAIN
+                .replace("struct V {", "struct P { uint pad; };\n            struct V {")
+                .replace("void main(uint3 gid : SV_GroupID,", "void main(uint3 gid : SV_GroupID, in payload P pl,")
+        }
+
+        /// One indirect mesh draw: its record (x, y, z), its count buffer's
+        /// value if it has one, and a record a title pass writes on the
+        /// card just before the draw.
+        #[derive(Clone, Copy)]
+        struct Draw {
+            record: [u32; 3],
+            count: Option<u32>,
+            written: Option<[u32; 3]>,
+        }
+
+        fn plain(x: u32) -> Draw {
+            Draw { record: [x, 1, 1], count: None, written: None }
+        }
+
+        fn dxc() -> Option<PathBuf> {
+            let dxc = match std::env::var_os("VICTORY_PC_DXC") {
+                Some(p) => PathBuf::from(p),
+                None => victory_shader::emit::validator::Validator::default_path()?.with_file_name("dxc.exe"),
+            };
+            dxc.exists().then_some(dxc)
+        }
+
+        fn compile(dxc: &Path, src: &str, profile: &str, tag: &str) -> Vec<u8> {
+            let dir = std::env::temp_dir().join(format!("victory-mesh-launch-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (hlsl, out) = (dir.join(format!("{tag}.hlsl")), dir.join(format!("{tag}.dxil")));
+            std::fs::write(&hlsl, src).unwrap();
+            let status = std::process::Command::new(dxc)
+                .args(["-nologo", "-T", profile, "-E", "main", "-Fo"])
+                .arg(&out)
+                .arg(&hlsl)
+                .status()
+                .unwrap();
+            assert!(status.success(), "dxc failed for {tag}");
+            std::fs::read(out).unwrap()
+        }
+
+        fn code(bytes: &[u8]) -> D3D12_SHADER_BYTECODE {
+            D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() }
+        }
+
+        #[repr(C, align(8))]
+        struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
+
+        #[repr(C)]
+        struct Stream {
+            root: Sub<*mut std::ffi::c_void>,
+            as_: Sub<D3D12_SHADER_BYTECODE>,
+            ms: Sub<D3D12_SHADER_BYTECODE>,
+            ps: Sub<D3D12_SHADER_BYTECODE>,
+            blend: Sub<D3D12_BLEND_DESC>,
+            mask: Sub<u32>,
+            raster: Sub<D3D12_RASTERIZER_DESC>,
+            depth: Sub<D3D12_DEPTH_STENCIL_DESC>,
+            targets: Sub<D3D12_RT_FORMAT_ARRAY>,
+            samples: Sub<DXGI_SAMPLE_DESC>,
+            topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+        }
+
+        /// A mesh pipeline (with `as_`, the stage in front) drawing into
+        /// one R32_FLOAT target, adding.
+        fn pipeline(
+            device: &ID3D12Device,
+            root: &ID3D12RootSignature,
+            as_: Option<&[u8]>,
+            ms: &[u8],
+            ps: &[u8],
+        ) -> windows::core::Result<ID3D12PipelineState> {
+            let mut blend = D3D12_BLEND_DESC::default();
+            blend.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: true.into(),
+                SrcBlend: D3D12_BLEND_ONE,
+                DestBlend: D3D12_BLEND_ONE,
+                BlendOp: D3D12_BLEND_OP_ADD,
+                SrcBlendAlpha: D3D12_BLEND_ONE,
+                DestBlendAlpha: D3D12_BLEND_ONE,
+                BlendOpAlpha: D3D12_BLEND_OP_ADD,
+                RenderTargetWriteMask: 0xf,
+                ..Default::default()
+            };
+            let mut targets = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
+            targets.RTFormats[0] = DXGI_FORMAT_R32_FLOAT;
+            let mut stream = Stream {
+                root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+                as_: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, as_.map(code).unwrap_or_default()),
+                ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(ms)),
+                ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, code(ps)),
+                blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
+                mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, u32::MAX),
+                raster: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER,
+                    D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: true.into(), ..Default::default() },
+                ),
+                depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC::default()),
+                targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, targets),
+                samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }),
+                topology: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE),
+            };
+            let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
+                SizeInBytes: size_of::<Stream>(),
+                pPipelineStateSubobjectStream: std::ptr::from_mut(&mut stream).cast(),
+            };
+            // SAFETY: the stream points at live code and state.
+            unsafe { device.cast::<ID3D12Device2>()?.CreatePipelineState(&desc) }
+        }
+
+        fn root_signature(device: &ID3D12Device, params: &[D3D12_ROOT_PARAMETER1]) -> ID3D12RootSignature {
+            let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+                Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
+                Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                    Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                        NumParameters: params.len() as u32,
+                        pParameters: params.as_ptr(),
+                        NumStaticSamplers: 0,
+                        pStaticSamplers: std::ptr::null(),
+                        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+                    },
+                },
+            };
+            // SAFETY: the description points at live parameters.
+            unsafe {
+                let mut blob: Option<ID3DBlob> = None;
+                let mut error: Option<ID3DBlob> = None;
+                D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)).expect("root signature");
+                let blob = blob.unwrap();
+                let bytes = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+                device.CreateRootSignature(0, bytes).expect("root signature made")
+            }
+        }
+
+        /// The test card, its pipelines and buffers.
+        struct Rig {
+            h: WarpHarness,
+            adapter: String,
+            plain: (ID3D12RootSignature, ID3D12PipelineState),
+            amplified: (ID3D12RootSignature, ID3D12PipelineState),
+            writer: Clamp,
+            signature: ID3D12CommandSignature,
+        }
+
+        /// The rig, or None with the reason (said by the caller as SKIPPED).
+        fn rig() -> Result<Rig, String> {
+            let h = WarpHarness::card().ok_or("no D3D12 device with mesh shaders (hardware adapter, then the software one)")?;
+            let dxc = dxc().ok_or("no dxc.exe (Windows SDK, or VICTORY_PC_DXC) to compile the test's own mesh and pixel shaders")?;
+            let ms_plain = compile(&dxc, MS_PLAIN, "ms_6_6", "ms_plain");
+            let ms_amp = compile(&dxc, &ms_amplified(), "ms_6_6", "ms_payload");
+            let ps = compile(&dxc, PS, "ps_6_6", "ps");
+            let stage = victory_shader::emit::mesh_launch_as();
+            let mesh = D3D12_SHADER_VISIBILITY_MESH;
+            let ms_params = [
+                D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 { Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 9, Num32BitValues: 3 } },
+                    ShaderVisibility: mesh,
+                },
+            ];
+            let mut amp_params = ms_params.to_vec();
+            amp_params.extend(crate::pipeline::host::launch_parameters());
+            let root_plain = root_signature(&h.device, &ms_params);
+            let root_amp = root_signature(&h.device, &amp_params);
+            let pso_plain = pipeline(&h.device, &root_plain, None, &ms_plain, &ps).map_err(|e| format!("the mesh pipeline was refused: {e}"))?;
+            let pso_amp = pipeline(&h.device, &root_amp, Some(&stage), &ms_amp, &ps)
+                .unwrap_or_else(|e| panic!("the card has mesh shaders and refused the pipeline with the mesh launch stage: {e}"));
+            let writer = compile_cs(&h.device, WRITER_CS).expect("the writer compiles");
+            let signature = h.signature(10, STRIDE);
+            let adapter = h.adapter.clone();
+            Ok(Rig { h, adapter, plain: (root_plain, pso_plain), amplified: (root_amp, pso_amp), writer, signature })
+        }
+
+        /// What a run left: the target's pixels (as bits), the budget
+        /// words, and the card's time for the draws in microseconds.
+        struct Ran {
+            pixels: Vec<u32>,
+            words: [u32; 7],
+            micros: f64,
+        }
+
+        /// Runs `draws` in one list, the stage's way (`amplified`) or the
+        /// clamp's, with the budget word at `budget` first and `rows`
+        /// target rows a draw.
+        fn run(r: &mut Rig, draws: &[Draw], budget: u32, rows: u32, amplified: bool) -> Ran {
+            run_with(r, draws, budget, rows, amplified, true)
+        }
+
+        /// [`run`]; `ordered` false gives every stage draw ticket 0, so no
+        /// draw waits for its turn (a measurement of what the turn costs;
+        /// the budget is then charged in no defined order).
+        fn run_with(r: &mut Rig, draws: &[Draw], budget: u32, rows: u32, amplified: bool, ordered: bool) -> Ran {
+            let n = draws.len() as u32;
+            let height = n * rows;
+            assert!(height <= 16384);
+            let h = &mut r.h;
+            let (args_buf, args_ptr, args_gpu) = h.shared_buffer(u64::from(n * STRIDE) + 4 * u64::from(n));
+            let count_at = |k: u32| u64::from(n * STRIDE) + 4 * u64::from(k);
+            // SAFETY: the mapping holds the records and the counts.
+            unsafe {
+                for (k, d) in draws.iter().enumerate() {
+                    let at = args_ptr.add(k * STRIDE as usize).cast::<u32>();
+                    for (i, &w) in d.record.iter().enumerate() {
+                        at.add(i).write_volatile(w);
+                    }
+                    at.add(3).write_volatile(0xdead_beef);
+                    args_ptr.add(count_at(k as u32) as usize).cast::<u32>().write_volatile(d.count.unwrap_or(0));
+                }
+            }
+            // The budget words in the card's own memory, as the layer keeps
+            // them (`VICTORY_INDIRECT_CARD_BUDGET`), filled from and read
+            // back through mapped memory.
+            let (budget_buf, budget_ptr, _) = h.shared_buffer(256);
+            // SAFETY: the mapping holds 256 bytes.
+            unsafe {
+                std::ptr::write_bytes(budget_ptr, 0, 256);
+                budget_ptr.cast::<u32>().write_volatile(budget);
+            }
+            let card_budget = h.default_uav(256);
+            // SAFETY: a live buffer.
+            let budget_gpu = unsafe { card_budget.GetGPUVirtualAddress() };
+            let scratch = h.default_uav(64 << 10);
+            // The target, cleared, and the read-back buffer.
+            let target = {
+                let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: u64::from(WIDTH),
+                    Height: height,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_R32_FLOAT,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                    ..Default::default()
+                };
+                let mut t: Option<ID3D12Resource> = None;
+                // SAFETY: plain texture creation.
+                unsafe {
+                    h.device
+                        .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, None, &mut t)
+                        .unwrap();
+                }
+                t.unwrap()
+            };
+            let (back, back_ptr, _) = h.shared_buffer(u64::from(WIDTH * 4 * height));
+            // SAFETY: plain descriptor heap and view creation, then our
+            // open list with live resources.
+            let micros = unsafe {
+                let rtv_heap: ID3D12DescriptorHeap = h
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() })
+                    .unwrap();
+                let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+                h.device.CreateRenderTargetView(&target, None, rtv);
+                let queries: ID3D12QueryHeap = {
+                    let mut q: Option<ID3D12QueryHeap> = None;
+                    h.device
+                        .CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0 }, &mut q)
+                        .unwrap();
+                    q.unwrap()
+                };
+                let (_stamps, stamps_ptr, _) = h.shared_buffer(16);
+                let l = h.list.clone();
+                let l6: ID3D12GraphicsCommandList6 = l.cast().unwrap();
+                l.ClearRenderTargetView(rtv, &[0.0; 4], None);
+                l.OMSetRenderTargets(1, Some(&rtv), false, None);
+                l.RSSetViewports(&[D3D12_VIEWPORT { Width: WIDTH as f32, Height: height as f32, MaxDepth: 1.0, ..Default::default() }]);
+                l.RSSetScissorRects(&[RECT { left: 0, top: 0, right: WIDTH as i32, bottom: height as i32 }]);
+                l.ResourceBarrier(&[transition(&card_budget, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                l.CopyBufferRegion(&card_budget, 0, &budget_buf, 0, 256);
+                l.ResourceBarrier(&[transition(&card_budget, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                l.EndQuery(&queries, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                let mut scratch_state = D3D12_RESOURCE_STATE_COMMON;
+                // The draw path's rule: a wait before a stage draw when
+                // something that may store ran since the last one (and
+                // before the first draw of the list).
+                let mut unordered = true;
+                for (k, d) in draws.iter().enumerate() {
+                    let k = k as u32;
+                    if let Some(w) = d.written {
+                        l.SetComputeRootSignature(&r.writer.root);
+                        l.SetPipelineState(&r.writer.pso);
+                        let c = [k * STRIDE, w[0], w[1], w[2]];
+                        l.SetComputeRoot32BitConstants(0, 4, c.as_ptr().cast(), 0);
+                        l.SetComputeRootUnorderedAccessView(1, args_gpu);
+                        l.Dispatch(1, 1, 1);
+                        unordered = true;
+                    }
+                    let draw_constants = [k, rows, height];
+                    let count = d.count.map(|_| (&args_buf, count_at(k)));
+                    if amplified {
+                        if unordered {
+                            wait_for_writes(&l);
+                            unordered = false;
+                        }
+                        l.SetGraphicsRootSignature(&r.amplified.0);
+                        l.SetPipelineState(&r.amplified.1);
+                        l.SetGraphicsRoot32BitConstants(0, 3, draw_constants.as_ptr().cast(), 0);
+                        let record = args_gpu + u64::from(k * STRIDE);
+                        let count_gpu = count.map(|(_, at)| args_gpu + at);
+                        assert!(launchable(STRIDE, record, count_gpu));
+                        let ticket = if ordered { k } else { 0 };
+                        record_launch(&l6, 1, ticket, (record, count_gpu), budget_gpu);
+                    } else {
+                        let recorded = record_clamp_as(
+                            &h.clamp,
+                            &l,
+                            (&scratch, scratch_state),
+                            budget_gpu,
+                            (&args_buf, u64::from(k * STRIDE)),
+                            count,
+                            (10, STRIDE, 1),
+                            false,
+                        );
+                        assert!(recorded);
+                        scratch_state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+                        l.SetGraphicsRootSignature(&r.plain.0);
+                        l.SetPipelineState(&r.plain.1);
+                        l.SetGraphicsRoot32BitConstants(0, 3, draw_constants.as_ptr().cast(), 0);
+                        l.ExecuteIndirect(&r.signature, 1, &scratch, 0, count.map(|(b, _)| b), count.map_or(0, |(_, at)| at));
+                    }
+                }
+                l.EndQuery(&queries, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                l.ResourceBarrier(&[transition(&card_budget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                l.CopyBufferRegion(&budget_buf, 0, &card_budget, 0, 256);
+                l.ResourceBarrier(&[transition(&card_budget, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+                if scratch_state != D3D12_RESOURCE_STATE_COMMON {
+                    l.ResourceBarrier(&[transition(&scratch, scratch_state, D3D12_RESOURCE_STATE_COMMON)]);
+                }
+                l.ResourceBarrier(&[transition(&target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_R32_FLOAT, Width: WIDTH, Height: height, Depth: 1, RowPitch: WIDTH * 4 },
+                };
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&back),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+                };
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&target),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                l.ResolveQueryData(&queries, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &_stamps, 0);
+                h.submit_and_wait();
+                let frequency = h.queue.GetTimestampFrequency().unwrap_or(0);
+                let stamps = stamps_ptr.cast::<u64>();
+                let (a, b) = (stamps.read_volatile(), stamps.add(1).read_volatile());
+                if frequency == 0 { 0.0 } else { b.saturating_sub(a) as f64 * 1e6 / frequency as f64 }
+            };
+            let pixels = (0..(WIDTH * height) as usize)
+                // SAFETY: the read-back holds the whole target.
+                .map(|i| unsafe { back_ptr.cast::<u32>().add(i).read_volatile() })
+                .collect();
+            // SAFETY: the run has finished.
+            let words = std::array::from_fn(|i| unsafe { budget_ptr.cast::<u32>().add(i).read_volatile() });
+            drop((budget_buf, back));
+            Ran { pixels, words, micros }
+        }
+
+        /// What the clamp's rules give for `draws` from budget `budget`:
+        /// the target's pixels and the clamp's three budget words.
+        fn expected(draws: &[Draw], budget: u32, rows: u32) -> (Vec<u32>, [u32; 3]) {
+            let n = draws.len() as u32;
+            let mut pixels = vec![0u32; (WIDTH * n * rows) as usize];
+            let (mut at, mut largest, mut asked) = (budget, 0u32, 0u32);
+            for (k, d) in draws.iter().enumerate() {
+                let record = d.written.unwrap_or(d.record);
+                let l = mesh_launch(record, d.count, at);
+                at = l.budget;
+                largest = largest.max(l.largest);
+                asked = asked.wrapping_add(l.asked);
+                let groups = l.groups[0] * l.groups[1] * l.groups[2];
+                for g in 0..groups {
+                    let (px, py) = (g % WIDTH, k as u32 * rows + g / WIDTH);
+                    pixels[(py * WIDTH + px) as usize] = 1.0f32.to_bits();
+                }
+            }
+            (pixels, [at, largest, asked])
+        }
+
+        /// Whether `draws` from budget `budget` all fit whole: then every
+        /// record runs whatever the order of the charges, and the stage's
+        /// result does not depend on its turn. Where the budget runs out,
+        /// the order decides which records run empty.
+        fn fit_whole(draws: &[Draw], budget: u32) -> bool {
+            let costs: u64 = draws
+                .iter()
+                .map(|d| u64::from(mesh_launch(d.written.unwrap_or(d.record), d.count, 0).budget))
+                .sum();
+            u64::from(budget) + costs <= u64::from(BUDGET)
+        }
+
+        /// Runs `draws` both ways and checks them against each other and
+        /// against the rules; the two runs' card times.
+        ///
+        /// The budget words are the same in any order of the charges (a
+        /// sum saturating at the budget, a maximum and a sum), so they are
+        /// compared on every adapter. A draw out of turn (the stage's late
+        /// word) changes only the order of the charges. A hardware card
+        /// runs the earlier draw's group well within the turn's limit, so
+        /// there none may be late. A software adapter runs groups on CPU
+        /// threads that the system may hold back for longer, so there the
+        /// late draws are said, and where the budget runs out in the list
+        /// (the order decides which records run empty) the targets are
+        /// then not compared, with the reason printed.
+        fn both_ways(test: &str, draws: &[Draw], budget: u32, rows: u32) -> Option<(f64, f64)> {
+            let mut r = match rig() {
+                Ok(r) => r,
+                Err(why) => {
+                    eprintln!("SKIPPED (cargo counts it as passed): {test}: {why}");
+                    return None;
+                }
+            };
+            let clamped = run(&mut r, draws, budget, rows, false);
+            let launched = run(&mut r, draws, budget, rows, true);
+            let (pixels, words) = expected(draws, budget, rows);
+            let off_rules = clamped.pixels.iter().zip(&pixels).position(|(a, b)| a != b);
+            assert_eq!(off_rules, None, "{test}: the clamp pass gave other groups than its rules (first pixel {off_rules:?})");
+            assert_eq!(clamped.words[..3], words, "{test}: the clamp's budget words against its rules");
+            assert_eq!(launched.words[..3], clamped.words[..3], "{test}: the budget words differ between the clamp pass and the stage");
+            assert_eq!(launched.words[3], draws.len() as u32, "{test}: the turn did not reach every draw");
+            let late = launched.words[4];
+            if r.h.software {
+                eprintln!("{test}: on {} (software adapter): {late} of {} draws charged out of turn", r.adapter, draws.len());
+            } else {
+                assert_eq!(late, 0, "{test}: draws charged out of turn on a hardware adapter: {}", r.adapter);
+            }
+            if late > 0 && !fit_whole(draws, budget) {
+                eprintln!(
+                    "{test}: targets NOT compared: {late} draws charged out of turn and the budget runs out in this list, so which records run empty depends on the order of the charges; the budget words were compared"
+                );
+            } else {
+                let differ = clamped.pixels.iter().zip(&launched.pixels).filter(|(a, b)| a != b).count();
+                assert_eq!(differ, 0, "{test}: {differ} pixels differ between the clamp pass and the stage");
+                assert!(clamped.pixels == launched.pixels, "{test}: the targets differ");
+            }
+            let clamps = draws
+                .iter()
+                .filter(|d| {
+                    let rec = d.written.unwrap_or(d.record);
+                    d.count != Some(0) && (rec[0] > 65_535 || rec[1] > 1 || rec[2] > 1)
+                })
+                .count() as u32;
+            assert_eq!(launched.words[5], clamps, "{test}: records the stage counted clamped");
+            eprintln!(
+                "{test}: on {}: {} draws, identical targets ({} pixels) and budget words {:?}; card time {:.1} us with the clamp pass, {:.1} us with the stage",
+                r.adapter,
+                draws.len(),
+                launched.pixels.len(),
+                &launched.words[..3],
+                clamped.micros,
+                launched.micros
+            );
+            Some((clamped.micros, launched.micros))
+        }
+
+        #[test]
+        fn records_of_every_size_launch_the_same_groups() {
+            let draws = [
+                plain(0),
+                plain(1),
+                plain(1000),
+                plain(65_535),
+                plain(65_536),
+                Draw { record: [u32::MAX; 3], count: None, written: None },
+                Draw { record: [5, 0, 1], count: None, written: None },
+                Draw { record: [7, 1, 0], count: None, written: None },
+                Draw { record: [7, 3, 9], count: None, written: None },
+                Draw { record: [9, 1, 1], count: Some(0), written: None },
+                Draw { record: [11, 1, 1], count: Some(3), written: None },
+                plain(256),
+            ];
+            both_ways("records_of_every_size_launch_the_same_groups", &draws, 0, 256);
+        }
+
+        #[test]
+        fn the_budget_runs_out_mid_list_the_same_way() {
+            // Room for two records of 65,535 groups and 500 groups more.
+            let start = BUDGET - (2 * 65_535 + 500) * 128;
+            let draws = [plain(65_535), plain(65_535), plain(400), plain(200), plain(0), plain(1), plain(65_535), Draw { record: [3, 1, 1], count: Some(0), written: None }];
+            both_ways("the_budget_runs_out_mid_list_the_same_way", &draws, start, 256);
+            // Exactly the rest: runs, and the next record runs empty.
+            let exact = [plain(65_535), plain(1)];
+            both_ways("the_budget_runs_out_mid_list_the_same_way (exact)", &exact, BUDGET - 65_535 * 128, 256);
+            // Seventeen of the largest from nothing: sixteen fit.
+            let seventeen = [plain(65_535); 17];
+            both_ways("the_budget_runs_out_mid_list_the_same_way (17)", &seventeen, 0, 256);
+        }
+
+        #[test]
+        fn records_written_on_the_card_just_before_their_draws_are_read() {
+            let draws: Vec<Draw> = (0..8u32)
+                .map(|k| Draw {
+                    record: [3, 1, 1],
+                    count: None,
+                    written: Some(match k {
+                        2 => [0, 1, 1],
+                        5 => [70_000, 1, 1],
+                        _ => [k * 100 + 7, 1, 1],
+                    }),
+                })
+                .collect();
+            both_ways("records_written_on_the_card_just_before_their_draws_are_read", &draws, 0, 256);
+        }
+
+        /// A thousand draws with different counts, one target row each;
+        /// together well within the budget.
+        fn a_thousand() -> Vec<Draw> {
+            (0..1000u32)
+                .map(|k| Draw {
+                    record: [(k * 37) % 200, 1, 1],
+                    count: if k % 9 == 4 { Some(k % 2) } else { None },
+                    written: None,
+                })
+                .collect()
+        }
+
+        /// A thousand draws in a row: the order of the turn holds over many
+        /// draws in flight.
+        #[test]
+        fn a_thousand_draws_in_a_row_launch_the_same_groups() {
+            let draws = a_thousand();
+            if let Some((clamped, launched)) = both_ways("a_thousand_draws_in_a_row_launch_the_same_groups", &draws, 0, 1) {
+                let mut r = rig().expect("the rig was made a moment ago");
+                let unordered = run_with(&mut r, &draws, 0, 1, true, false);
+                eprintln!(
+                    "a_thousand_draws_in_a_row_launch_the_same_groups: per draw {:.2} us with the clamp pass, {:.2} us with the stage, {:.2} us with the stage and no turn (every ticket 0)",
+                    clamped / 1000.0,
+                    launched / 1000.0,
+                    unordered.micros / 1000.0
+                );
+            }
+        }
+
+        /// Every draw charges at once: every ticket 0, so no draw waits for
+        /// a turn, as a draw that charges out of turn does not wait. No
+        /// charge may be lost, whatever the timing, on every adapter. A
+        /// thousand draws within the budget: the budget words and the
+        /// target equal the clamp pass's. Forty draws of 65,535 groups from
+        /// an unspent budget: any sixteen fit and no more, so exactly
+        /// sixteen run whole, the rest run empty, and the budget is spent.
+        #[test]
+        fn draws_that_charge_at_once_lose_no_charge() {
+            let test = "draws_that_charge_at_once_lose_no_charge";
+            let mut r = match rig() {
+                Ok(r) => r,
+                Err(why) => {
+                    eprintln!("SKIPPED (cargo counts it as passed): {test}: {why}");
+                    return;
+                }
+            };
+            let draws = a_thousand();
+            assert!(fit_whole(&draws, 0));
+            let clamped = run(&mut r, &draws, 0, 1, false);
+            let at_once = run_with(&mut r, &draws, 0, 1, true, false);
+            assert_eq!(at_once.words[..3], clamped.words[..3], "{test}: the budget words differ from the clamp pass's (a charge was lost)");
+            assert_eq!(at_once.words[4], 0, "{test}: no draw waits, so none is late");
+            let differ = clamped.pixels.iter().zip(&at_once.pixels).filter(|(a, b)| a != b).count();
+            assert_eq!(differ, 0, "{test}: {differ} pixels differ from the clamp pass's");
+
+            let big = [plain(65_535); 40];
+            assert!(!fit_whole(&big, 0));
+            let rows = 256;
+            let ran = run_with(&mut r, &big, 0, rows, true, false);
+            let one = 1.0f32.to_bits();
+            let groups: Vec<usize> = ran
+                .pixels
+                .chunks((WIDTH * rows) as usize)
+                .map(|p| {
+                    assert!(p.iter().all(|&v| v == 0 || v == one), "{test}: a group ran more than once");
+                    p.iter().filter(|&&v| v == one).count()
+                })
+                .collect();
+            assert!(groups.iter().all(|&g| g == 0 || g == 65_535), "{test}: a draw ran in part: {groups:?}");
+            let whole = groups.iter().filter(|&&g| g == 65_535).count();
+            assert_eq!(whole, 16, "{test}: draws that ran whole on a budget for sixteen");
+            assert_eq!(ran.words[0], BUDGET, "{test}: the budget is spent");
+            eprintln!(
+                "{test}: on {}: 1000 draws at once gave the clamp pass's budget words {:?} and target; of 40 draws of 65,535 groups at once, 16 ran whole",
+                r.adapter,
+                &at_once.words[..3]
+            );
         }
     }
 }

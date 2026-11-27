@@ -383,6 +383,10 @@ fn submit_split(this: This, lists: &[This]) {
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&now);
+        // These lists were run here, not detached: nothing else returns the
+        // slots of their fresh per-draw tables until the title resets them.
+        // The 262,144-slot ring would fill and later draws would be dropped.
+        crate::list::tables_done(&lists[..cut]);
     }
     if cut < lists.len() {
         static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -796,6 +800,7 @@ fn release_held_now(all: bool) {
                         // Passed at a present without being met: what the
                         // queue stood at.
                         if all && !value_met(&wait) {
+                            victory_core::causes::note(victory_core::causes::Cause::WaitForced);
                             static SEEN: AtomicU64 = AtomicU64::new(0);
                             if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
                                 tracing::warn!(
@@ -881,6 +886,7 @@ fn release_held_now(all: bool) {
                             }
                         }
                         if all {
+                            victory_core::causes::note(victory_core::causes::Cause::WaitForced);
                             #[cfg(feature = "diagnostics")]
                             crate::copystat::add(crate::copystat::C::Forced, 1);
                             static ONCE: AtomicBool = AtomicBool::new(false);
@@ -1100,6 +1106,10 @@ fn execute_now(this: This, count: u32, lists: *const This) {
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
+        victory_core::causes::note_n(
+            victory_core::causes::Cause::ListLostAtExecute,
+            (lists.len() - host_lists.len()) as u64,
+        );
         host.execute(&host_lists);
         crate::list::tables_done(lists);
         // What the lists wrote at the bottom of the pipe may be a fence
@@ -1344,6 +1354,7 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(windows)]
     crate::framelog::add(crate::framelog::T::PresentLineUs, presenting.elapsed().as_micros() as u64);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    victory_core::causes::set_frame(frame);
     #[cfg(windows)]
     if sent_behind && PRESENTS_BEHIND.load(Ordering::Relaxed).is_multiple_of(512) {
         tracing::info!(
@@ -1410,6 +1421,9 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
+    } else if !sent_behind && planes > 0 {
+        // A plane was given but nothing of it could be shown.
+        victory_core::causes::note(victory_core::causes::Cause::PresentNotShown);
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
@@ -1517,6 +1531,7 @@ extern "system" fn copy_page_mappings(
         }
     }
     if !ok {
+        victory_core::causes::note(victory_core::causes::Cause::PageMappingFailed);
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
     }
@@ -1661,6 +1676,49 @@ mod tests {
         assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
         assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
         assert_eq!(new[35], execute_x as *const ()); // 0x118
+    }
+
+    /// The lists a split submission runs at once give their per-draw
+    /// tables' dynamic slots back to the host heap (`tables_done` after
+    /// `host.execute`), so the ring does not wait for the title's reset to
+    /// get them back.
+    #[cfg(windows)]
+    #[test]
+    fn lists_a_split_submission_runs_give_their_tables_back() {
+        let null = std::ptr::null();
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let (allocator, list) = crate::list::test_list();
+        let h = crate::descriptor::test_view_heap(64);
+        let title = crate::descriptor::heap(h);
+        let (Some(host), Some(host_list)) = (title.host(), crate::list::host_list(list)) else {
+            // no host GPU
+            release(list);
+            release(allocator);
+            release(h);
+            return;
+        };
+        let free = host.free_dynamic();
+        let first = host.dynamic(3).unwrap();
+        crate::list::test_state(list, |state| state.hold_dynamic(h as usize, title.identity, first, 3));
+        assert_eq!(host.free_dynamic(), free - 3);
+        host_list.close();
+        // No wait in the list: all of it runs at once.
+        submit_split(q, &[list]);
+        assert_eq!(host.free_dynamic(), free, "the slots of a list run at once were not given back");
+        let mut held = usize::MAX;
+        crate::list::test_state(list, |state| held = state.dynamic_held());
+        assert_eq!(held, 0);
+        release(list);
+        release(allocator);
+        release(h);
     }
 
     #[test]

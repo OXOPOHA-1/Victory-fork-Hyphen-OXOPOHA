@@ -17,9 +17,9 @@
 //!
 //! The span of a copy is worked out again only when one of its slots went.
 //!
-//! From fork pull request #523, as darkworldhm's snapshot carries it. Here
-//! the pass is taken only with `VICTORY_HEAP_PASS_MARKED` ([`marked`]);
-//! unset, `draw::State::heap_buffers` runs as it always did.
+//! From fork pull request #523, as darkworldhm's snapshot carries it. The
+//! marked pass is the default; set `VICTORY_HEAP_PASS_MARKED=0` to fall back
+//! to the old full-scan pass.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -29,13 +29,17 @@ pub(crate) const FULL_EVERY: u64 = 256;
 /// two looks at every slot with the old pass).
 pub(crate) const ORPHANS_EVERY: u64 = 16;
 
-/// What `VICTORY_HEAP_PASS_MARKED` says: 0 unset (off), 1 on, 2 in turn.
+/// What `VICTORY_HEAP_PASS_MARKED` says: 0 off, 1 on, 2 in turn.
+/// Defaults to on: the marked pass avoids rescanning the full heap every 16
+/// passes, which is very expensive in heavy scenes. Set to 0 for the old
+/// full-scan behavior.
 fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_PASS_MARKED").as_deref() {
+        Ok("0") => 0,
         Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 0,
+        _ => 1,
     })
 }
 
@@ -64,10 +68,10 @@ pub(crate) fn marked_paused() -> bool {
 }
 
 /// Whether the pass over the heap's buffer views looks only at marked
-/// slots now (`VICTORY_HEAP_PASS_MARKED=1`; off by default: every slot
-/// every 16 passes, as before). `alt`: twenty seconds with, twenty without,
-/// in turn, each change said in the log; the first pass of each turn looks
-/// at every slot.
+/// slots now (`VICTORY_HEAP_PASS_MARKED=1`, the default). Set
+/// `VICTORY_HEAP_PASS_MARKED=0` for the old behavior (every slot every 16
+/// passes). `alt`: twenty seconds with, twenty without, in turn, each
+/// change said in the log; the first pass of each turn looks at every slot.
 pub(crate) fn marked() -> bool {
     match mode() {
         0 => false,

@@ -835,11 +835,13 @@ fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
     let Some(scheduler) = scheduler() else {
+        victory_core::causes::note(victory_core::causes::Cause::StorageDropped);
         return;
     };
     let mut lanes = scheduler.lock();
     loop {
         let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
+            victory_core::causes::note(victory_core::causes::Cause::StorageDropped);
             return; // closed: dropped (a status releases its array)
         };
         // One slot stays free, as the console's count of empty slots says.
@@ -907,6 +909,7 @@ extern "system" fn close(this: QueueRef) {
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
+        victory_core::causes::note(victory_core::causes::Cause::StorageRequestFailed);
         tracing::warn!(
             options = format_args!("{options:#x}"),
             offset = request.offset,
@@ -1034,10 +1037,12 @@ fn bcpack_tables() -> Result<&'static Tables, HRESULT> {
     match TABLES.get_or_init(load_bcpack_tables) {
         Ok(tables) => Ok(tables),
         Err(why) if !WARNED.swap(true, Ordering::Relaxed) => {
+            victory_core::causes::note(victory_core::causes::Cause::StorageBcpack);
             tracing::warn!("dstorage: BCPack requests fail: {why} (more at debug)");
             Err(E_NOTIMPL)
         }
         Err(_) => {
+            victory_core::causes::note(victory_core::causes::Cause::StorageBcpack);
             tracing::debug!("dstorage: BCPack request failed: no tables");
             Err(E_NOTIMPL)
         }
@@ -1198,6 +1203,7 @@ fn into_destination(
         super::xmem::pages_written(pages, offset, n);
         Ok(())
     } else {
+        victory_core::causes::note(victory_core::causes::Cause::StoragePagesNotWritten);
         let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
         tracing::warn!(
             known = super::xmem::pages_known(pages, offset, len),

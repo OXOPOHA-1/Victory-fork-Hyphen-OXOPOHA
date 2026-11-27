@@ -246,15 +246,16 @@ pub fn run(
     if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
         victory_shader::emit::set_host_max_wave(n);
     }
-    let dll = validate.then(Validator::default_path).flatten();
-    if validate {
-        Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
-        println!(
-            "validator    {}",
-            dll.as_ref()
-                .map_or("dxil.dll".into(), |p| p.display().to_string())
-        );
-    }
+    let dll = if validate {
+        let path = Validator::default_path().ok_or_else(|| anyhow::anyhow!(
+            "no installed x64 Windows SDK validator selected; install the Windows SDK or unset VICTORY_DXIL"
+        ))?;
+        Validator::load(Some(&path)).map_err(anyhow::Error::msg)?;
+        println!("validator    {}", path.display());
+        Some(path)
+    } else {
+        None
+    };
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
     }
@@ -282,8 +283,10 @@ pub fn run(
             };
             let jobs = sources(&data);
             let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
+            std::thread::scope(|s| -> Result<()> {
                 for _ in 0..threads.min(jobs.len()) {
+                    let validator = dll.as_deref().map(|p| Validator::load(Some(p)))
+                        .transpose().map_err(anyhow::Error::msg)?;
                     s.spawn(|| {
                         let mut t = Tally {
                             list,
@@ -291,9 +294,7 @@ pub fn run(
                         };
                         let mut checks = Checks {
                             keep: (!pairs.is_empty()).then(|| kept.clone()),
-                            validator: validate
-                                .then(|| Validator::load(dll.as_deref()).ok())
-                                .flatten(),
+                            validator,
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
@@ -304,7 +305,8 @@ pub fn run(
                         lock(&total).merge(t);
                     });
                 }
-            });
+                Ok(())
+            })?;
         }
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());

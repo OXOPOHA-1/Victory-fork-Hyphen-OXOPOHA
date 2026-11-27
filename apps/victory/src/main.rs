@@ -3,8 +3,14 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod ab;
 mod census;
+#[cfg(windows)]
+mod device_facts;
 mod inspect;
+mod logline;
+mod raw;
+mod report;
 mod run;
 mod shader;
 mod translate;
@@ -71,8 +77,8 @@ enum Command {
     /// translator and report what it cannot handle yet.
     Translate {
         paths: Vec<PathBuf>,
-        /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
-        /// else the newest Windows SDK's).
+        /// Check emitted DXIL with the newest installed Windows SDK validator.
+        /// VICTORY_DXIL may select another installed SDK's x64/dxil.dll by full path.
         #[arg(long)]
         validate: bool,
         /// Also create a host D3D12 pipeline for each emitted shader.
@@ -92,6 +98,44 @@ enum Command {
         #[arg(long)]
         warm: Option<PathBuf>,
     },
+    /// Inspect blobs saved by VICTORY_RAW_SAVE.
+    Raw {
+        dir: PathBuf,
+        /// Print one debug line per blob with all fields.
+        #[arg(long)]
+        list: bool,
+    },
+    /// Compare two runs' logs (VICTORY_FRAME_LOG=1, the whole stderr) over
+    /// single frames with at least --min-draws host draws. Use the same
+    /// save, warm cache and scene in both runs.
+    Ab {
+        a: PathBuf,
+        b: PathBuf,
+        #[arg(long, default_value_t = 3000)]
+        min_draws: u64,
+        /// Geometry (mesh or vertex) and pixel shader hashes to align by,
+        /// e.g. --anchor aaaa:bbbb. Repeatable; the first and last one
+        /// found bound the measurement.
+        #[arg(long)]
+        anchor: Vec<String>,
+    },
+    /// Turn one run's log (the whole stderr) into a short report: host
+    /// device, switches, render scale, frame times, dropped work, warnings
+    /// and errors by message, panics. User paths are replaced; no game data
+    /// is copied.
+    Report {
+        log: PathBuf,
+        /// Also write report.txt into this directory (outside the repository).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// A folder to replace by a placeholder, such as the game's. Repeatable.
+        #[arg(long)]
+        scrub: Vec<PathBuf>,
+    },
+    /// Ask each hardware graphics adapter's D3D12 device what it supports
+    /// (wave size, mesh shaders, upload heaps, heaps on existing memory).
+    /// No title needed.
+    Device,
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -174,6 +218,13 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        Command::Raw { dir, list } => raw::run(&dir, list),
+        Command::Ab { a, b, min_draws, anchor } => ab::compare(&a, &b, min_draws, &anchor),
+        Command::Report { log, out, scrub } => report::run(&log, out.as_deref(), &scrub),
+        #[cfg(windows)]
+        Command::Device => device_facts::run(),
+        #[cfg(not(windows))]
+        Command::Device => anyhow::bail!("`victory device` asks D3D12 and runs on Windows only"),
         Command::Run {
             exe,
             unimplemented,

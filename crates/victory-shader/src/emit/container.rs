@@ -152,11 +152,14 @@ pub(crate) struct Psv<'a> {
     pub outputs: &'a [SigElement],
     /// Mesh: per-primitive outputs.
     pub prims: &'a [SigElement],
-    /// Mesh: its state and the group-shared bytes it declares.
-    pub mesh: Option<(super::shader::Mesh, u32)>,
+    /// Mesh: its state, the group-shared bytes and the payload bytes it
+    /// declares.
+    pub mesh: Option<(super::shader::Mesh, u32, u32)>,
     /// Geometry (triangles in, triangle strips out on stream 0): its
     /// maximum vertex count. `flag`: writes `SV_Position`.
     pub geometry: Option<u32>,
+    /// Amplification: the payload bytes it hands its mesh groups.
+    pub amplification: Option<u32>,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
@@ -202,13 +205,19 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     info[29] = p.outputs.len() as u8;
     info[31] = in_vectors as u8;
     info[32] = out_vectors as u8;
-    if let Some((mesh, shared)) = p.mesh {
+    if let Some((mesh, shared, payload)) = p.mesh {
         info[0..4].copy_from_slice(&shared.to_le_bytes());
+        // MSInfo.PayloadSizeInBytes.
+        info[8..12].copy_from_slice(&payload.to_le_bytes());
         info[12..14].copy_from_slice(&(mesh.max_vertices as u16).to_le_bytes());
         info[14..16].copy_from_slice(&(mesh.max_primitives as u16).to_le_bytes());
         info[26] = vectors(p.prims) as u8;
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
+    }
+    if let Some(payload) = p.amplification {
+        // ASInfo.PayloadSizeInBytes.
+        info[0..4].copy_from_slice(&payload.to_le_bytes());
     }
     if let Some(max_vertices) = p.geometry {
         // Input primitive (3: triangles), output topology (5: triangle

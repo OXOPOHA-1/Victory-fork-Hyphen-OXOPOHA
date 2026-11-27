@@ -70,6 +70,9 @@ pub enum T {
     Uploads,
     /// Waiting for host pipelines being made.
     PipelineWaitUs,
+    /// Draws and dispatches dropped because their host pipeline was not
+    /// made yet when the frame's wait ran out (`VICTORY_PIPELINE_WAIT_MS`).
+    PipelineLateDrops,
     /// Writes taken by the guards on view memory.
     GuardFaults,
     /// The title's frame waits: time slept, on every thread.
@@ -330,7 +333,7 @@ pub(crate) fn free_mb() -> u64 {
 }
 
 /// Values read when a frame ends, all running totals but the last.
-const S: usize = 11;
+const S: usize = 12;
 const S_THREAD_USER: usize = 0;
 const S_THREAD_KERNEL: usize = 1;
 const S_PROCESS_USER: usize = 2;
@@ -343,6 +346,8 @@ const S_STAGING_REUSED: usize = 8;
 const S_STAGING_MADE: usize = 9;
 /// Not a total: the free memory then.
 const S_FREE_MB: usize = 10;
+/// Draws made with the same pipeline as the preceding draw.
+const S_SAME_PIPE: usize = 11;
 
 fn sample() -> [u64; S] {
     let (tu, tk) = thread_times();
@@ -359,6 +364,7 @@ fn sample() -> [u64; S] {
         crate::texture::SPARE_STATS[0].load(Relaxed),
         crate::texture::SPARE_STATS[1].load(Relaxed),
         free_mb(),
+        crate::draw::same_pipeline_drawn(),
     ]
 }
 
@@ -412,9 +418,9 @@ fn text(f: &Frame) -> String {
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
-         readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
+         readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited, {:.0} draws dropped as not made yet | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
-         draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
+         draws, {:.0} with the preceding draw's pipeline | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
         f.us / 1e3,
         (s(S_THREAD_USER) + s(S_THREAD_KERNEL)) / 1e3,
         s(S_THREAD_USER) / 1e3,
@@ -457,6 +463,7 @@ fn text(f: &Frame) -> String {
         s(S_PIPELINES_MADE),
         s(S_PIPELINES_LOADED),
         ms(T::PipelineWaitUs),
+        t(T::PipelineLateDrops),
         t(T::DiskReads),
         t(T::DiskBytes) / 1e6,
         ms(T::DiskUs),
@@ -466,6 +473,7 @@ fn text(f: &Frame) -> String {
         s(S_PROCESS_KERNEL) / 1e3,
         ms(T::PaceUs),
         s(S_DRAWS),
+        s(S_SAME_PIPE),
         s(S_FREE_MB),
         t(T::RenderSlow),
         t(T::RenderLooks),
@@ -501,7 +509,9 @@ fn long_over(usual: f64) -> f64 {
     (usual * 1.5).max(usual + 40_000.0)
 }
 
-/// The lines of a reading: the frame times, the usual frame, the long ones.
+/// The lines of a reading: the frame times, the draws of the same frames
+/// (so `victory ab` can weigh single frames by their draws instead of the
+/// usual frame's mean), the usual frame, the long ones.
 fn lines(frames: &[Frame], usual: f64, seconds: f64) -> Vec<String> {
     let over = long_over(usual);
     let (long, plain): (Vec<&Frame>, Vec<&Frame>) = frames.iter().partition(|f| f.us > over);
@@ -520,6 +530,12 @@ fn lines(frames: &[Frame], usual: f64, seconds: f64) -> Vec<String> {
         usual / 1e3,
         each.join(" ")
     )];
+    let draws: Vec<String> = frames.iter().map(|f| format!("{:.0}", f.s[S_DRAWS])).collect();
+    out.push(format!(
+        "frame draws: the host draws recorded in each of the same {} frames, in order; each: {}",
+        frames.len(),
+        draws.join(" ")
+    ));
     if !plain.is_empty() {
         out.push(format!("usual frame (the mean of {} not long): {}", plain.len(), text(&mean(&plain))));
     }
@@ -608,6 +624,7 @@ mod tests {
         let mut f = Frame { number, at: number as f64, us: ms * 1e3, t: [0.0; N], s: [0.0; S], h: [0.0; HN] };
         f.t[T::PresentUs as usize] = ms * 100.0;
         f.t[T::Uploads as usize] = ms;
+        f.s[S_DRAWS] = ms * 10.0;
         f
     }
 
@@ -615,9 +632,11 @@ mod tests {
     fn a_long_frame_is_listed_beside_the_usual_one() {
         let frames: Vec<Frame> = [150.0, 160.0, 140.0, 400.0, 150.0].iter().enumerate().map(|(i, &ms)| frame(i as u64, ms)).collect();
         let out = lines(&frames, 150_000.0, 1.0);
-        assert_eq!(out.len(), 3, "{out:#?}");
+        assert_eq!(out.len(), 4, "{out:#?}");
         assert!(out[0].starts_with("frame times: 5 frames in 1.0 s: shortest 140 ms, median 150, longest 400; 1 long (over 225 ms"), "{}", out[0]);
         assert!(out[0].ends_with("each: 150 160 140 400 150"), "{}", out[0]);
+        assert_eq!(out[1], "frame draws: the host draws recorded in each of the same 5 frames, in order; each: 1500 1600 1400 4000 1500");
+        let out = &out[1..];
         // The usual frame is the mean of the four that are not long.
         assert!(out[1].starts_with("usual frame (the mean of 4 not long): 150 ms |"), "{}", out[1]);
         assert!(out[1].contains("in the present call 15.0 "), "{}", out[1]);

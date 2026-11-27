@@ -928,6 +928,7 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
+    victory_core::causes::note(victory_core::causes::Cause::CallInputUnsupported);
     tracing::warn!(
         slot = format_args!("{SLOT:#x}"),
         "input device method not implemented"

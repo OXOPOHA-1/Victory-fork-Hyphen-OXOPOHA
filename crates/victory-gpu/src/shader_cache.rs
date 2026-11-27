@@ -101,11 +101,38 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     }
 }
 
+/// The translation of a mesh shader for the place behind the layer's mesh
+/// launch stage (`victory_shader::emit::translate_amplified`), from the
+/// cache when there is one. Filed under its own key: the build key with the
+/// payload size mixed in, so it never meets the plain translation of the
+/// same container, and a change of the payload size is a new key.
+pub(crate) fn host_shader_amplified(container: &[u8]) -> Result<HostShader, String> {
+    let translate =
+        |c: &[u8]| victory_shader::emit::translate_amplified(c).map_err(|e| e.to_string());
+    match CACHE.get() {
+        Some(cache) => cached(cache, &amplified_build(&build()), container, translate),
+        None => translate(container),
+    }
+}
+
+/// The key of the mesh launch form: `build` and the payload size the
+/// form declares.
+fn amplified_build(build: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"victory shader cache, mesh launch payload\0");
+    h.update(build);
+    h.update(&victory_shader::emit::MESH_LAUNCH_PAYLOAD.to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
 /// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
+/// encoded translation out. `ran` tells a miss from a hit; `made` keeps
+/// what the translation gave, so a cache that cannot store it does not
+/// translate the shader a second time.
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
+    made: std::sync::Mutex<Option<Result<HostShader, String>>>,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -118,8 +145,10 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        let made = (self.translate)(&input[32..]);
+        let encoded = made.as_ref().map(encode).map_err(|e| anyhow::Error::msg(e.clone()));
+        *self.made.lock().unwrap_or_else(|e| e.into_inner()) = Some(made);
+        encoded
     }
 }
 
@@ -133,11 +162,36 @@ fn cached(
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
+        made: std::sync::Mutex::new(None),
     };
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
+        // A cache that cannot store or give back an entry (a full disk, a
+        // file another program holds) does not lose the shader for the run:
+        // the translation made for it is used, or one is made without the
+        // cache below. A translation that failed is that error.
+        let path = match cache.get_or_convert(&converter, &input) {
+            Ok(path) => path,
+            Err(e) => {
+                match converter.made.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    Some(Err(_)) => return Err(format!("{e:#}")),
+                    Some(Ok(shader)) => {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        victory_core::causes::note(victory_core::causes::Cause::ShaderCacheNotStored);
+                        ONCE.call_once(|| tracing::warn!(error = %format!("{e:#}"), "shader cache cannot store translations"));
+                        tracing::debug!(error = %format!("{e:#}"), "shader translated, not cached");
+                        MISSES.fetch_add(1, Ordering::Relaxed);
+                        return Ok(shader);
+                    }
+                    None => {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        victory_core::causes::note(victory_core::causes::Cause::ShaderCacheNotStored);
+                        ONCE.call_once(|| tracing::warn!(error = %format!("{e:#}"), "shader cache not usable; translating without it"));
+                        tracing::debug!(error = %format!("{e:#}"), "shader cache not usable");
+                        break;
+                    }
+                }
+            }
+        };
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
@@ -148,6 +202,7 @@ fn cached(
             tracing::debug!(path = %path.display(), "shader {what}");
             return Ok(shader);
         }
+        victory_core::causes::note(victory_core::causes::Cause::ShaderCacheUnreadable);
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
@@ -392,6 +447,29 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn the_mesh_launch_form_has_a_key_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        let amplified = amplified_build(&build);
+        assert_ne!(amplified, build);
+        assert_eq!(amplified, amplified_build(&build), "the same build gives the same key");
+        assert_ne!(amplified, amplified_build(&[8; 32]), "another build, another key");
+
+        let container = b"a mesh shader container".as_slice();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &amplified, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2, "the plain entry does not serve the form");
+        assert_eq!(cached(&cache, &amplified, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2, "the form comes back from disk");
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

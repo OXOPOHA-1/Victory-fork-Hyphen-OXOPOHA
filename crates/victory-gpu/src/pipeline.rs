@@ -67,6 +67,10 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// A mesh shader's translation for the place behind the layer's mesh
+    /// launch stage ([`Shader::amplified`]).
+    #[cfg(windows)]
+    amplified: OnceLock<Option<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -109,6 +113,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
         .or_insert_with(|| {
+            // Once per distinct container, for `VICTORY_RAW_SAVE`'s index
+            // (unset: one check of a value made once).
+            #[cfg(windows)]
+            crate::device::raw_save_container(stage, bytes);
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             Arc::new(Shader {
@@ -119,6 +127,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                #[cfg(windows)]
+                amplified: OnceLock::new(),
             })
         })
         .clone()
@@ -132,6 +142,10 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// What its translation in this run approximated: loops cut at an
+    /// iteration cap, values with no DXIL form zero at joins (0, 0 for a
+    /// translation from the cache).
+    pub(crate) approximations: [u32; 2],
 }
 
 #[cfg(windows)]
@@ -157,6 +171,24 @@ impl Shader {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
+                if let Ok(t) = &done {
+                    let [loops, joins] = t.approximations;
+                    if loops > 0 {
+                        victory_core::causes::note(victory_core::causes::Cause::ShaderLoopsCapped);
+                    }
+                    if joins > 0 {
+                        victory_core::causes::note(victory_core::causes::Cause::ShaderJoinZero);
+                    }
+                    if loops + joins > 0 {
+                        tracing::info!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            loops_capped = loops,
+                            joins_zeroed = joins,
+                            "a translated program with approximations: loops cut at an iteration cap, values with no DXIL form zero at joins"
+                        );
+                    }
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
@@ -165,16 +197,43 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        victory_core::causes::note(victory_core::causes::Cause::ShaderNotTranslated);
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        )
+                    }
                 }
                 done.ok()
             })
             .as_ref()
+    }
+
+    /// A mesh shader translated for the place behind the layer's mesh
+    /// launch stage (`victory_shader::emit::translate_amplified`): the
+    /// same translation, declaring the stage's payload. Made on first use,
+    /// through the shader cache under a key of its own; None for other
+    /// stages and when it does not translate (its draws then take the clamp
+    /// pass).
+    pub(crate) fn amplified(&self) -> Option<&[u8]> {
+        if self.stage != "mesh" {
+            return None;
+        }
+        self.amplified
+            .get_or_init(|| {
+                crate::descriptor::host::probe_view_limit();
+                match crate::shader_cache::host_shader_amplified(&self.container) {
+                    Ok(t) => Some(t.dxil),
+                    Err(e) => {
+                        tracing::warn!(hash = %self.hash, error = %e, "mesh shader does not translate for the mesh launch stage");
+                        None
+                    }
+                }
+            })
+            .as_deref()
     }
 }
 
@@ -188,7 +247,12 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    // What the translation approximated (nothing when it came from the
+    // cache: only translations made in this run are counted).
+    let _ = victory_shader::emit::take_approximations();
+    let host = crate::shader_cache::host_shader(container);
+    let approximations = victory_shader::emit::take_approximations();
+    let host = host?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
         .into_iter()
@@ -200,7 +264,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated { host, used, stores, approximations })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -505,6 +569,28 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// At a draw or dispatch dropped without a host pipeline: counts it if
+/// this thread's last look found the pipeline still being made
+/// (`make::note_drop`).
+#[cfg(windows)]
+pub(crate) fn note_late_drop() {
+    make::note_drop();
+}
+
+/// Whether this thread's last pipeline look found it still being made when
+/// the frame's wait ran out (`make::last_look_late`).
+#[cfg(windows)]
+pub(crate) fn last_look_late() -> bool {
+    make::last_look_late()
+}
+
+/// Draws and dispatches dropped because their pipeline was not made yet
+/// within the frame's wait, since the last call.
+#[cfg(windows)]
+pub(crate) fn take_late_drops() -> u64 {
+    make::take_late_drops()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -755,6 +841,10 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        #[cfg(windows)]
+        if stage == Some("amplification") {
+            host::TITLE_AMPLIFICATION[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(stage) = stage {
             // SAFETY: a shader subobject has its bytecode at +8.
             let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };

@@ -57,12 +57,23 @@ impl Cache {
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;
-        // Write-then-rename so readers never see partial output.
+        // Write-then-rename so readers never see partial output. A process
+        // killed before its rename leaves the staging name behind, and a
+        // later process can have the same pid and counter. Only the writer
+        // ever reads such a file, and it is gone, so an existing one is
+        // written again instead of losing this conversion for the whole run.
         let tmp = tempfile_in(dir);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp)
+                    .with_context(|| format!("reusing the staging file {}", tmp.display()))?
+            }
+            Err(e) => return Err(e.into()),
+        };
         let written = file.write_all(&output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
@@ -74,10 +85,14 @@ impl Cache {
     }
 }
 
+/// Names staging files. A process killed before it cleans up can leave a
+/// name that a later process with the same pid meets again (see
+/// [`Cache::get_or_convert`]).
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn tempfile_in(dir: &Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    use std::sync::atomic::Ordering;
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     dir.join(format!(".tmp-{}-{n}", std::process::id()))
 }
 
@@ -85,6 +100,12 @@ fn tempfile_in(dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // The tests share the process-wide staging-file counter.
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     struct Upper {
         version: u32,
@@ -105,7 +126,30 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_staging_file_does_not_lose_the_conversion() {
+        let _one = one_at_a_time();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let path = cache.path_for(&CacheKey::new(&conv, b"abc"));
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        // The name the next staging file gets, left half-written by a
+        // process that was killed before it could rename it.
+        let stale = dir.join(format!(".tmp-{}-0", std::process::id()));
+        TEMP_COUNTER.store(0, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(&stale, b"half-written").unwrap();
+        assert_eq!(cache.get_or_convert(&conv, b"abc").unwrap(), path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"ABC");
+        assert!(!stale.exists(), "the stale staging file was reused");
+    }
+
+    #[test]
     fn converts_once_then_hits() {
+        let _one = one_at_a_time();
         let tmp = tempfile::tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("cache")).unwrap();
         let conv = Upper {
@@ -121,6 +165,7 @@ mod tests {
 
     #[test]
     fn failed_publication_removes_the_staging_file() {
+        let _one = one_at_a_time();
         let tmp = tempfile::tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("cache")).unwrap();
         let conv = Upper {

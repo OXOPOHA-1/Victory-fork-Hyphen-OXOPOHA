@@ -71,6 +71,19 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Adds a reference only while the object still has one: a caller that
+/// looked it up under a lock can pin it for use after the lock is gone, and
+/// must not revive one that is being released.
+pub(crate) fn add_ref_alive(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    // SAFETY: `this` is one of our objects, held by the caller's lock.
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n > 0).then_some(n + 1))
+        .is_ok()
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
@@ -95,6 +108,7 @@ pub(crate) fn answer(kind: usize, iid: *const Iid, found: Option<This>, out: *mu
     };
     // SAFETY: the title passes an interface id (null is tolerated).
     let iid = unsafe { iid.as_ref() }.map(guid_text).unwrap_or_default();
+    victory_core::causes::note(victory_core::causes::Cause::CallUnknownInterface);
     tracing::warn!(object = KINDS[kind], %iid, "unknown interface");
     // SAFETY: checked non-null.
     unsafe { out.write(std::ptr::null()) };
@@ -280,6 +294,7 @@ static REPORTED: [[AtomicBool; MAX_SLOTS]; KINDS.len()] =
 /// image for title calls). Wrong for a slot that returns a value instead of
 /// an `HRESULT`.
 extern "system" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
+    victory_core::causes::note(victory_core::causes::Cause::CallNotImplementedMethod);
     if !REPORTED[KIND][SLOT].swap(true, Ordering::Relaxed) {
         tracing::warn!(
             object = KINDS[KIND],

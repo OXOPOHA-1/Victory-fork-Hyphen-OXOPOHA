@@ -155,6 +155,22 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     crate::profile::seen(crate::profile::Seen::Record);
 }
 
+/// For tests: a direct title list and its allocator.
+#[cfg(all(test, windows))]
+pub(crate) fn test_list() -> (This, This) {
+    let null = std::ptr::null();
+    let (mut allocator, mut list) = (null, null);
+    assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+    assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+    (allocator, list)
+}
+
+/// For tests: runs `f` with a title list's draw state ([`with_state`]).
+#[cfg(all(test, windows))]
+pub(crate) fn test_state(this: This, f: impl FnOnce(&mut crate::draw::State)) {
+    with_state(this, |_, state| f(state));
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.
@@ -395,6 +411,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             continue;
         }
         let Some(fresh) = fresh_list() else {
+            victory_core::causes::note(victory_core::causes::Cause::ListLostNoHostList);
             continue;
         };
         // A new host list is open; the title's next call on its list is a
@@ -404,6 +421,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         let Some(host) = list.host.replace(fresh) else {
+            victory_core::causes::note(victory_core::causes::Cause::ListLostNoHostList);
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -467,6 +485,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             continue;
         }
         let Some(fresh) = fresh_list() else {
+            victory_core::causes::note(victory_core::causes::Cause::ListLostNoHostList);
             continue;
         };
         // A new host list is open; the title's next call on its list is a
@@ -477,6 +496,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
             let Some(host) = (*list).host.replace(fresh) else {
+                victory_core::causes::note(victory_core::causes::Cause::ListLostNoHostList);
                 continue;
             };
             let uploads =
@@ -839,6 +859,7 @@ extern "system" fn copy_buffer_region(
 fn unlike(dst: This, src: This) -> bool {
     let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
     if unlike {
+        victory_core::causes::note(victory_core::causes::Cause::CopyStandInFormat);
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             tracing::warn!(?dst, ?src, "copy between a stand-in target and title-format texels skipped")
@@ -864,6 +885,18 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         ) {
             if unlike(dst, src) {
                 return;
+            }
+            // The render scale (nothing at 100): a scaled target and a
+            // texture of the title's size have host textures of two sizes,
+            // which no whole-resource copy joins. Left out and counted; the
+            // destination keeps what it held.
+            if crate::resource::render_scale() != 100 {
+                // SAFETY: live textures.
+                let (a, b) = unsafe { (to.GetDesc(), from.GetDesc()) };
+                if (a.Width, a.Height) != (b.Width, b.Height) {
+                    crate::resource::scale_left_out(0, "CopyResource");
+                    return;
+                }
             }
             // Two title textures over the same memory have one host
             // texture between them: the copy would be of that texture onto
@@ -911,6 +944,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(src),
         ) {
             list.defer_copy(to, from, a.min(b) as usize);
+        } else {
+            // Neither two host textures nor two buffers: nothing is copied.
+            victory_core::causes::note(victory_core::causes::Cause::CopyNoHostTexture);
         }
     }
     #[cfg(not(windows))]
@@ -967,6 +1003,10 @@ extern "system" fn copy_texture_region(
             static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let made = read_back(list, dst, x, y, z, src, source_box);
+            // (A render-scaled source is counted as such in `read_back`.)
+            if made.is_err_and(|why| why != "a render-scaled source") {
+                victory_core::causes::note(victory_core::causes::Cause::ReadBackRefused);
+            }
             if n <= 16 || n.is_multiple_of(4096) || made.is_err() {
                 static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if made.is_err() && REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 16 {
@@ -993,6 +1033,27 @@ extern "system" fn copy_texture_region(
         if unlike(dst.resource, src.resource) {
             return;
         }
+        // The render scale (nothing at 100): between two scaled textures
+        // the title's corner and box are taken to host pixels below; a
+        // copy between a scaled texture and one of the title's size (or
+        // texels from a buffer into a scaled one) would need a resample,
+        // and is left out and counted.
+        let scaled = if crate::resource::render_scale() != 100 {
+            let from_ratio = (src.kind != FOOTPRINT)
+                .then(|| crate::resource::host_resource(src.resource))
+                .flatten()
+                .and_then(|t| crate::resource::host_ratio(src.resource, t));
+            match (crate::resource::host_ratio(dst.resource, to), from_ratio) {
+                (None, None) => None,
+                (Some(a), Some(b)) => Some((a, b)),
+                _ => {
+                    crate::resource::scale_left_out(1, "CopyTextureRegion");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let mut from = src;
         // Both sides are the same subresource of one host texture (set below).
         let mut same = false;
@@ -1001,12 +1062,15 @@ extern "system" fn copy_texture_region(
         let mut read = None;
         if src.kind == FOOTPRINT {
             let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+                victory_core::causes::note(victory_core::causes::Cause::CopyBufferToTexture);
                 return;
             };
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
+                victory_core::causes::note(victory_core::causes::Cause::CopyBufferToTexture);
                 return;
             };
             let Some((buffer, staging)) = list.upload(host, bytes) else {
+                victory_core::causes::note(victory_core::causes::Cause::CopyBufferToTexture);
                 return;
             };
             // The list owns this mapped D3D12 upload buffer. Wine can report
@@ -1022,6 +1086,7 @@ extern "system" fn copy_texture_region(
             _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
+                victory_core::causes::note(victory_core::causes::Cause::CopyNoHostTexture);
                 return;
             };
             // The same subresource of one host texture on both sides (two
@@ -1057,7 +1122,27 @@ extern "system" fn copy_texture_region(
         ensure_state(list, dst.resource, COPY_DEST);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        let mut host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        let (mut x, mut y) = (x, y);
+        let scaled_box;
+        if let Some((to_ratio, from_ratio)) = scaled {
+            let Some(source) = crate::resource::host_resource(src.resource) else {
+                return;
+            };
+            // SAFETY: the title's box or null.
+            let title_box = unsafe { source_box.as_ref() }.copied();
+            let Some((at, region)) = scaled_region(
+                (to, dst.footprint.offset as u32, to_ratio),
+                (source, src.footprint.offset as u32, from_ratio),
+                (x, y),
+                title_box,
+            ) else {
+                return;
+            };
+            (x, y) = at;
+            scaled_box = region;
+            host_box = Some(&raw const scaled_box);
+        }
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
@@ -1099,6 +1184,51 @@ extern "system" fn copy_texture_region(
     let _ = (this, dst, x, y, z, src, source_box);
 }
 
+/// With a render scale, a texture to texture copy between two scaled
+/// textures: the destination corner `at` and the source box `title_box`
+/// (`None`: the whole source subresource) are in title pixels; each side's
+/// are taken to its host pixels by its host/title size (`(texture,
+/// subresource, ratio)`), each edge rounded to the nearest pixel, and the
+/// box is clipped to the source and to what the destination holds from
+/// the corner on. `None` if nothing is left to copy.
+#[cfg(windows)]
+fn scaled_region(
+    to: (&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, [f64; 2]),
+    from: (&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, [f64; 2]),
+    at: (u32, u32),
+    title_box: Option<[u32; 6]>,
+) -> Option<((u32, u32), windows::Win32::Graphics::Direct3D12::D3D12_BOX)> {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_RESOURCE_DESC};
+    // A subresource's width and height on the host (level of the index).
+    let size = |d: &D3D12_RESOURCE_DESC, sub: u32| {
+        let level = sub % u32::from(d.MipLevels.max(1));
+        (((d.Width >> level).max(1)) as u32, (d.Height >> level).max(1))
+    };
+    // SAFETY: live textures.
+    let (to_desc, from_desc) = unsafe { (to.0.GetDesc(), from.0.GetDesc()) };
+    let (to_w, to_h) = size(&to_desc, to.1);
+    let (from_w, from_h) = size(&from_desc, from.1);
+    let scale = |v: u32, s: f64| (f64::from(v) * s).round() as u32;
+    let (x, y) = (scale(at.0, to.2[0]).min(to_w), scale(at.1, to.2[1]).min(to_h));
+    let (left, top, front, right, bottom, back) = match title_box {
+        Some([l, t, f, r, b, k]) => (
+            scale(l, from.2[0]),
+            scale(t, from.2[1]),
+            f,
+            scale(r, from.2[0]),
+            scale(b, from.2[1]),
+            k,
+        ),
+        None => (0, 0, 0, from_w, from_h, 1),
+    };
+    let right = right.min(from_w).min(left.saturating_add(to_w - x));
+    let bottom = bottom.min(from_h).min(top.saturating_add(to_h - y));
+    (left < right && top < bottom).then_some((
+        (x, y),
+        D3D12_BOX { left, top, front, right, bottom, back },
+    ))
+}
+
 /// Records a texture to buffer copy (a read back) of [`copy_texture_region`]
 /// into `list`, or says why not.
 #[cfg(windows)]
@@ -1131,6 +1261,12 @@ fn read_back(
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
+    // The render scale (nothing at 100): the title's buffer takes texels at
+    // its own size and pitch, which a scaled texture does not have.
+    if crate::resource::host_ratio(src.resource, texture).is_some() {
+        crate::resource::scale_left_out(2, "a read back");
+        return Err("a render-scaled source");
+    }
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
@@ -1222,6 +1358,11 @@ extern "system" fn resolve(
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
                 // The console clips a larger source to the destination.
+                // Under a render scale the two sizes can also be a scaled
+                // and an unscaled texture: clipped the same, and counted.
+                if crate::resource::render_scale() != 100 {
+                    crate::resource::scale_left_out(3, "ResolveSubresource");
+                }
                 let rect = RECT {
                     left: 0,
                     top: 0,
@@ -1241,6 +1382,9 @@ extern "system" fn resolve(
                 );
             }
         }
+    } else if host_list(this).is_some() {
+        // A side without a host texture: nothing is resolved.
+        victory_core::causes::note(victory_core::causes::Cause::ResolveLeftOut);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
@@ -1265,12 +1409,16 @@ extern "system" fn clear_rtv(
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
         else {
+            if host_list(this).is_some() {
+                victory_core::causes::note(victory_core::causes::Cause::ClearLeftOut);
+            }
             return;
         };
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
         ) else {
+            victory_core::causes::note(victory_core::causes::Cause::ClearLeftOut);
             return;
         };
         // SAFETY: the title passes four floats (null is tolerated).
@@ -1281,6 +1429,12 @@ extern "system" fn clear_rtv(
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
+        // Rectangles in title pixels, on a render-scaled target: in its
+        // host pixels (`crate::resource::host_ratio`; none at scale 100).
+        let scaled: Option<Vec<windows::Win32::Foundation::RECT>> = rects
+            .zip(crate::resource::host_ratio(record.resource, texture))
+            .map(|(rects, ratio)| rects.iter().map(|r| crate::resource::scale_rect(r, ratio)).collect());
+        let rects = scaled.as_deref().or(rects);
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
@@ -1316,18 +1470,27 @@ extern "system" fn clear_dsv(
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
         else {
+            if host_list(this).is_some() {
+                victory_core::causes::note(victory_core::causes::Cause::ClearLeftOut);
+            }
             return;
         };
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
         ) else {
+            victory_core::causes::note(victory_core::causes::Cause::ClearLeftOut);
             return;
         };
         let rects = (count > 0 && !rects.is_null()).then(|| {
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
+        // As for a render target's clear (`clear_rtv`).
+        let scaled: Option<Vec<windows::Win32::Foundation::RECT>> = rects
+            .zip(crate::resource::host_ratio(record.resource, texture))
+            .map(|(rects, ratio)| rects.iter().map(|r| crate::resource::scale_rect(r, ratio)).collect());
+        let rects = scaled.as_deref().or(rects);
         const DEPTH_WRITE: u32 = 0x10;
         // A depth texture shaders also write: what they wrote, first (the
         // clear may be of one slice or of some rectangles).
@@ -1410,6 +1573,10 @@ extern "system" fn resolve_queries(
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
     const PIPELINE_STATISTICS: u32 = 3;
+    // Timestamps are the GPU's own clock; the rest are made up.
+    if kind != TIMESTAMP {
+        victory_core::causes::note_n(victory_core::causes::Cause::CallQueryResults, u64::from(count));
+    }
     let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
         return;
     };
@@ -1647,6 +1814,7 @@ mod state {
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
         if y * z != 1 {
+            victory_core::causes::note(victory_core::causes::Cause::MeshGroupsYz);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
@@ -1664,6 +1832,7 @@ mod state {
     ) {
         super::count_draw();
         if indirect != 0 {
+            victory_core::causes::note(victory_core::causes::Cause::IndirectMeshX);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
@@ -1745,6 +1914,7 @@ extern "system" fn execute_indirect(
 ) {
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
+        victory_core::causes::note(victory_core::causes::Cause::IndirectDropped);
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
@@ -1761,6 +1931,11 @@ extern "system" fn execute_indirect(
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
+        if args.len() != 1 {
+            victory_core::causes::note(victory_core::causes::Cause::IndirectRootArguments);
+        } else {
+            victory_core::causes::note(victory_core::causes::Cause::IndirectNotTitleBuffer);
+        }
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
@@ -1772,6 +1947,8 @@ extern "system" fn execute_indirect(
         return;
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(windows)]
+    crate::pipeline::note_late_drop();
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {

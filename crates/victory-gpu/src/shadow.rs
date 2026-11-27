@@ -389,6 +389,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         // Said, with the numbers it was decided by: run 193 made 31 copies
         // of 95 and no line named the others. The first 64, then every
         // 32nd.
+        victory_core::causes::note(victory_core::causes::Cause::CardCopyRefused);
         let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
         let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
         if n <= 64 || n.is_multiple_of(32) {
@@ -410,11 +411,13 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        victory_core::causes::note(victory_core::causes::Cause::CardCopyRefused);
         return None;
     }
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        victory_core::causes::note(victory_core::causes::Cause::CardCopyRefused);
     }
     buffer
 }
@@ -1537,7 +1540,21 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        // The old count was a quarter of the logical processors, capped at
+        // six: on a 20-core machine that left most cores idle while the
+        // submitting thread did the copies and comparisons alone. The
+        // default now uses half the machine, with a switch to tune it.
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let n = *N.get_or_init(|| {
+            std::env::var("VICTORY_WIDE_THREADS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map_or(4, |n| n.get() / 2)
+                })
+                .clamp(2, 32)
+        });
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1560,8 +1577,16 @@ fn workers() -> &'static Workers {
 }
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all
-/// of them are done. The jobs copy and compare memory; they do not panic.
-fn wide(jobs: Vec<Job>) {
+/// of them are done. The jobs copy and compare memory.
+///
+/// A job that panics cannot hold the caller: each job is run under
+/// `catch_unwind` and counts itself done whether it returned or panicked,
+/// so the worker thread lives on and the caller's wait ends. Once every
+/// job is done the first panic is raised again on this thread, as it
+/// would have been had the jobs run here one after the other: the work is
+/// not left half done in silence. `kind` names the work for the log line,
+/// said once per kind ([`WIDE_PANICS`] counts every one).
+fn wide(kind: &'static str, jobs: Vec<Job>) {
     if jobs.len() < 2 {
         for job in jobs {
             job();
@@ -1569,17 +1594,19 @@ fn wide(jobs: Vec<Job>) {
         return;
     }
     let workers = workers();
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    let left = Arc::new(Left { n: Mutex::new(jobs.len()), done: std::sync::Condvar::new(), panic: Mutex::new(None) });
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
             let left = left.clone();
             queue.push_back(Box::new(move || {
-                job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+                    left.panic.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(payload);
+                }
+                let mut n = left.n.lock().unwrap_or_else(|e| e.into_inner());
                 *n -= 1;
                 if *n == 0 {
-                    left.1.notify_all();
+                    left.done.notify_all();
                 }
             }));
         }
@@ -1592,16 +1619,54 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    {
+        let mut n = left.n.lock().unwrap_or_else(|e| e.into_inner());
+        while *n > 0 {
+            n = left.done.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    let panic = left.panic.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(payload) = panic {
+        wide_panicked(kind, payload.as_ref());
+        std::panic::resume_unwind(payload);
     }
 }
 
+/// What the jobs of one [`wide`] call share: how many are still to finish,
+/// the word that none is, and the first panic among them.
+struct Left {
+    n: Mutex<usize>,
+    done: std::sync::Condvar,
+    panic: Mutex<Option<Box<dyn std::any::Any + Send>>>,
+}
+
+/// Since the start: [`wide`] calls in which a job panicked.
+pub(crate) static WIDE_PANICS: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a panic in a [`wide`] job and logs it, once for each `kind`.
+fn wide_panicked(kind: &'static str, payload: &(dyn std::any::Any + Send)) {
+    let n = WIDE_PANICS.fetch_add(1, Ordering::Relaxed) + 1;
+    static SAID: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if said.contains(&kind) {
+        return;
+    }
+    said.push(kind);
+    let text = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "(no message)".to_owned());
+    tracing::error!(
+        "a job of {kind} panicked on a worker thread: {text}; the other jobs finished and the panic is raised again on the calling thread ({n} worker jobs panicked so far; said once per kind of work)"
+    );
+}
+
 /// [`wide`], for the host's own work on host copies (a submission's
-/// refreshes, the merge of what shaders wrote to card copies).
-pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
-    wide(jobs);
+/// refreshes, the merge of what shaders wrote to card copies, the
+/// submission's steps). `kind` names the work in the log if a job panics.
+pub(crate) fn wide_run(kind: &'static str, jobs: Vec<Box<dyn FnOnce() + Send>>) {
+    wide(kind, jobs);
 }
 
 /// About this many bytes to a piece of work for [`wide`].
@@ -1619,7 +1684,7 @@ pub(crate) fn take_snapshots() {
     if snaps.is_empty() {
         return;
     }
-    wide(copy_jobs(snaps));
+    wide("snapshots", copy_jobs(snaps));
 }
 
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
@@ -1750,7 +1815,7 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         }
     }
     flush(&mut group, &mut jobs);
-    wide(jobs);
+    wide("the search for shader writes", jobs);
     let mut found = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
     found.sort_unstable_by_key(|f| (f.0, f.1));
     let mut out = vec![Vec::new(); count];
@@ -1811,9 +1876,53 @@ mod wide_tests {
                     }) as Job
                 })
                 .collect();
-            wide(jobs);
+            wide("test jobs", jobs);
             assert_eq!(ran.load(Ordering::Relaxed), n * (n + 1) / 2, "{n} jobs");
         }
+    }
+
+    /// A job that panics does not hold the caller: `wide` comes back with
+    /// that panic once every other job has run, and the kept threads still
+    /// take work afterwards. Run on a thread of its own so that a hang
+    /// fails the test instead of stopping it.
+    #[test]
+    fn wide_job_panic_is_raised_on_the_caller_not_hung() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for round in 0..20usize {
+                let ran = Arc::new(AtomicUsize::new(0));
+                let jobs: Vec<Job> = (0..64usize)
+                    .map(|i| {
+                        let ran = ran.clone();
+                        Box::new(move || {
+                            if i == round || i == 40 {
+                                panic!("job {i} of round {round} fails on purpose");
+                            }
+                            ran.fetch_add(1, Ordering::Relaxed);
+                        }) as Job
+                    })
+                    .collect();
+                let before = super::WIDE_PANICS.load(Ordering::Relaxed);
+                let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wide("test panics", jobs)));
+                assert!(got.is_err(), "round {round}: the panic reaches the caller");
+                assert_eq!(ran.load(Ordering::Relaxed), 62, "round {round}: every other job ran");
+                assert!(super::WIDE_PANICS.load(Ordering::Relaxed) > before);
+            }
+            // The kept threads are all still there and take work.
+            let ran = Arc::new(AtomicUsize::new(0));
+            let jobs: Vec<Job> = (0..256usize)
+                .map(|_| {
+                    let ran = ran.clone();
+                    Box::new(move || {
+                        ran.fetch_add(1, Ordering::Relaxed);
+                    }) as Job
+                })
+                .collect();
+            wide("test jobs", jobs);
+            tx.send(ran.load(Ordering::Relaxed)).unwrap();
+        });
+        let ran = rx.recv_timeout(std::time::Duration::from_secs(60)).expect("wide hung or the test thread failed");
+        assert_eq!(ran, 256);
     }
 
     /// Copies cut into jobs copy every byte once: long ones, short ones
@@ -1829,7 +1938,7 @@ mod wide_tests {
         let copies: Vec<(usize, usize, usize)> = cuts.windows(2).map(|w| (s + w[0], d + w[0], w[1] - w[0])).collect();
         let jobs = copy_jobs(copies);
         assert!(jobs.len() >= 3);
-        wide(jobs);
+        wide("test copies", jobs);
         assert!(src == dst);
     }
 
@@ -1905,6 +2014,7 @@ fn back_piece(
     title.clear();
     title.resize(n, 0);
     if !read(first, title) {
+        victory_core::causes::note(victory_core::causes::Cause::ShadowBackUnreadable);
         return None;
     }
     // Title memory with the GPU's bytes put in; the copy takes the title's
@@ -2672,7 +2782,7 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
-    const IDLE_FRAMES: u64 = 4;
+    let idle_frames = 4 * crate::host::idle_scale();
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -2683,7 +2793,7 @@ pub(crate) fn let_go_idle() {
         let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
         let idle = |s: &Arc<Shadow>| {
             Arc::strong_count(s) == 1
-                && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, idle_frames)
                 && crate::host::references(&s.buffer) == 1
         };
         let keys: Vec<(u64, u64)> = map.iter().filter(|(_, s)| idle(s)).map(|(key, _)| *key).collect();
@@ -4298,16 +4408,16 @@ pub(crate) static LOOKUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// found, weakly (a copy nothing else holds can still be let go), for as
 /// long as the tables have not changed ([`TABLES_CHANGED`]).
 ///
-/// Here: OFF unless `VICTORY_LOOKUP_CACHE=1` until a run of ours has carried
-/// it (the pull request has it on by default); `alt`: twenty seconds with,
-/// twenty without, in turn, each change said in the log.
+/// On by default; set `VICTORY_LOOKUP_CACHE=0` to disable. `alt`: twenty
+/// seconds with, twenty without, in turn, each change said in the log.
 fn lookup_cache() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     match *MODE.get_or_init(|| match std::env::var("VICTORY_LOOKUP_CACHE").as_deref() {
+        Ok("0") => 0,
         Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,

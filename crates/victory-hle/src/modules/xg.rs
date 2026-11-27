@@ -110,6 +110,7 @@ pub extern "system" fn XGCreateTextureComputer(
         return E_INVALIDARG;
     };
     let Some(texture) = texture(&desc) else {
+        victory_core::causes::note(victory_core::causes::Cause::CallTextureComputer);
         tracing::warn!(?desc, "no texture layout");
         return E_INVALIDARG;
     };
@@ -400,6 +401,7 @@ extern "system" fn copy_into(
         .layout
         .tile(tiled, a.mip, a.slice, linear, row as usize, depth as usize);
     if r.is_err() {
+        victory_core::causes::note(victory_core::causes::Cause::CallTextureComputer);
         tracing::warn!(?r, desc = ?c.desc, subresource, "copy into a texture failed");
     }
     result(r)
@@ -437,6 +439,7 @@ extern "system" fn copy_from(
         .layout
         .detile(tiled, a.mip, a.slice, linear, row as usize, depth as usize);
     if r.is_err() {
+        victory_core::causes::note(victory_core::causes::Cause::CallTextureComputer);
         tracing::warn!(?r, desc = ?c.desc, subresource, "copy out of a texture failed");
     }
     result(r)
@@ -572,6 +575,7 @@ extern "system" fn element_offset(
 /// Slots the title does not call: size, alignment, offsets, coordinates,
 /// view descriptor, tiled-resource query.
 extern "system" fn unused(this: This) -> HRESULT {
+    victory_core::causes::note(victory_core::causes::Cause::CallTextureComputer);
     tracing::warn!(desc = ?computer(this).desc, "unimplemented texture computer method");
     E_NOTIMPL
 }

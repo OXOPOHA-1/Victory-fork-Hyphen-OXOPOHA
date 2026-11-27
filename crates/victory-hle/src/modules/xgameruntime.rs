@@ -122,6 +122,7 @@ pub extern "system" fn add_ref(_: *const Object) -> u32 {
 pub extern "system" fn missing<const SLOT: usize>(this: *const Object) -> HRESULT {
     // SAFETY: title code calls methods on objects we handed out.
     let area = unsafe { (*this).area };
+    victory_core::causes::note(victory_core::causes::Cause::CallRuntimeMethod);
     tracing::warn!(
         area,
         slot = format_args!("{:#x}", SLOT * 8),
@@ -252,6 +253,7 @@ pub extern "system" fn QueryApiImpl(
         unsafe { out.write((object as *const Object).cast_mut().cast()) };
         return S_OK;
     }
+    victory_core::causes::note(victory_core::causes::Cause::CallRuntimeArea);
     let mut queried = QUERIED.lock().unwrap_or_else(|e| e.into_inner());
     if !queried.contains(&(provider, iid)) {
         queried.push((provider, iid));

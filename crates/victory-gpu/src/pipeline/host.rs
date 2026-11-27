@@ -459,6 +459,7 @@ pub(crate) fn bounded_root_srvs() -> bool {
 }
 
 /// One stage of a host pipeline and where its bindings go.
+#[derive(Clone)]
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
     /// The root parameter of its user data, and its size in dwords.
@@ -501,10 +502,33 @@ pub(crate) struct HostPipeline {
     /// listing (empty for compute).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pub(crate) state: String,
+    /// A mesh pipeline's form with the layer's mesh launch stage in front
+    /// (`crate::indirect::mesh_amplify`): the same stages and root
+    /// parameters, then the stage's own ([`HostPipeline::launch_params`]).
+    /// None when the switch is off or the form could not be made.
+    pub(crate) amplified: Option<Box<HostPipeline>>,
+    /// In the form with the launch stage: the root parameter of its user
+    /// data (ticket, flags), then its record SRV, count SRV and budget UAV.
+    pub(crate) launch_params: u32,
 }
+
+/// Title pipelines made with an amplification stage (console subobject
+/// kind 23), and host pipelines refused for one: such a stage is not
+/// translated (no sample exists to build its translation from).
+pub(crate) static TITLE_AMPLIFICATION: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Why mesh pipelines got no form with the launch stage, since the start:
+/// the mesh shader does not translate for it, the root signature is
+/// refused (more than 64 dwords), the pipeline is refused, the stage
+/// itself could not be made.
+pub(crate) static NO_AMPLIFIED_FORM: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+    // Every refused pipeline is counted; the line is logged once a reason.
+    victory_core::causes::note(victory_core::causes::Cause::PipelineRefused);
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&reason) {
@@ -526,6 +550,14 @@ impl HostPipeline {
             [cs] if cs.stage == "compute" => Some(cs),
             _ => None,
         };
+        if shaders.iter().any(|s| s.stage == "amplification") {
+            TITLE_AMPLIFICATION[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            victory_core::causes::note(victory_core::causes::Cause::PipelineTitleAmplification);
+            return refuse(
+                "the title's amplification stage (subobject kind 23) is not translated: there is no sample to build it from",
+                shaders,
+            );
+        }
         if compute.is_none()
             && shaders
                 .iter()
@@ -684,6 +716,7 @@ impl HostPipeline {
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
+                victory_core::causes::note(victory_core::causes::Cause::PipelineRefused);
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
                 return None;
             }
@@ -715,7 +748,16 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    // (a program pinned to a wave size the card's known range lacks is refused
+                    // when it is translated; the range is here for the other refusals)
+                    let w = victory_shader::emit::host_waves();
+                    victory_core::causes::note(victory_core::causes::Cause::PipelineRefused);
+                    tracing::warn!(
+                        error = %e,
+                        ?shaders,
+                        host_wave_lanes = %format_args!("{}..{}", w.min, w.max),
+                        "host pipeline refused"
+                    );
                     host.log_messages();
                     return None;
                 }
@@ -733,6 +775,8 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
+                amplified: None,
+                launch_params: 0,
             });
         }
         let Some(g) = g else {
@@ -768,6 +812,7 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
+                    victory_core::causes::note(victory_core::causes::Cause::PipelineRefused);
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
@@ -775,6 +820,14 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
+            // Its indirect draws launch through the layer's stage, when
+            // the switch is on (`crate::indirect::mesh_amplify`).
+            let amplified = match mesh {
+                Some(ms) if crate::indirect::mesh_amplify() => {
+                    amplified_form(shaders, ms, code(1), &params, &samplers, g, depth_bounds, &bound)
+                }
+                _ => None,
+            };
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
@@ -786,6 +839,8 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
+                amplified,
+                launch_params: 0,
             });
         }
 
@@ -874,6 +929,7 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
+                victory_core::causes::note(victory_core::causes::Cause::PipelineRefused);
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
                 return None;
@@ -929,7 +985,175 @@ impl HostPipeline {
                     b.RenderTargetWriteMask
                 )
             },
+            amplified: None,
+            launch_params: 0,
         })
+    }
+}
+
+/// The form of a mesh pipeline with the layer's mesh launch stage in front
+/// (`crate::indirect::mesh_amplify`): the mesh shader translated to take
+/// the stage's payload, the same pixel shader and state, and a root
+/// signature with the same parameters first (so the draw binds them as for
+/// the plain form) and the stage's four after them. None, counted by why
+/// ([`NO_AMPLIFIED_FORM`]), when any part cannot be made: its draws then
+/// take the clamp pass.
+#[allow(clippy::too_many_arguments)] // the parts of the plain form it is made from
+fn amplified_form(
+    shaders: &[Arc<Shader>],
+    ms: &Shader,
+    ps: D3D12_SHADER_BYTECODE,
+    params: &[D3D12_ROOT_PARAMETER1],
+    samplers: &[D3D12_STATIC_SAMPLER_DESC],
+    g: &GraphicsState,
+    depth_bounds: bool,
+    stages: &[Stage],
+) -> Option<Box<HostPipeline>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let host = host()?;
+    let Some(stage) = crate::indirect::mesh_launch_stage() else {
+        NO_AMPLIFIED_FORM[3].fetch_add(1, Relaxed);
+        victory_core::causes::note(victory_core::causes::Cause::MeshNoFormStage);
+        return None;
+    };
+    let Some(ms_code) = ms.amplified() else {
+        NO_AMPLIFIED_FORM[0].fetch_add(1, Relaxed);
+        victory_core::causes::note(victory_core::causes::Cause::MeshNoFormTranslate);
+        return None;
+    };
+    let launch_params = params.len() as u32;
+    let mut all = params.to_vec();
+    all.extend(launch_parameters());
+    let (root, root_blob) = match root_signature(&host.device, &all, samplers, false) {
+        Ok(root) => root,
+        Err(e) => {
+            NO_AMPLIFIED_FORM[1].fetch_add(1, Relaxed);
+            victory_core::causes::note(victory_core::causes::Cause::MeshNoFormRoot);
+            tracing::warn!(error = %e, ?shaders, "root signature for the mesh launch stage refused; this pipeline's indirect mesh draws take the clamp pass");
+            return None;
+        }
+    };
+    let name = super::library::name(
+        "mesh amplified triangles",
+        &root_blob,
+        &[stage, ms_code, &code_bytes(&ps)],
+        &g.describe(),
+    );
+    let made = mesh_pipeline_amplified(&host.device, &root, (bytecode(stage), bytecode(ms_code), ps), g, depth_bounds, &name);
+    let pso = match made {
+        Ok(pso) => pso,
+        Err(e) => {
+            NO_AMPLIFIED_FORM[2].fetch_add(1, Relaxed);
+            victory_core::causes::note(victory_core::causes::Cause::MeshNoFormRefused);
+            tracing::warn!(error = %e, ?shaders, "host mesh pipeline with the mesh launch stage refused; this pipeline's indirect mesh draws take the clamp pass");
+            host.log_messages();
+            return None;
+        }
+    };
+    crate::host::name(&pso, || format!("{shaders:?} with the mesh launch stage"));
+    Some(Box::new(HostPipeline {
+        compute: false,
+        mesh: true,
+        pso,
+        root,
+        stages: stages.to_vec(),
+        name: format!("{shaders:?} with the mesh launch stage"),
+        slots: 0,
+        inputs: Vec::new(),
+        rects: false,
+        state: String::new(),
+        amplified: None,
+        launch_params,
+    }))
+}
+
+/// The root parameters of the mesh launch stage, in this order: its user
+/// data (ticket, flags), the record, the count, the budget words.
+pub(crate) fn launch_parameters() -> [D3D12_ROOT_PARAMETER1; 4] {
+    use victory_shader::emit::{MESH_LAUNCH_SLOT_BUDGET, MESH_LAUNCH_SLOT_COUNT, MESH_LAUNCH_SLOT_RECORD, MESH_LAUNCH_USER_DWORDS};
+    let visibility = D3D12_SHADER_VISIBILITY_AMPLIFICATION;
+    let view = |kind, slot: u8| D3D12_ROOT_PARAMETER1 {
+        ParameterType: kind,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: u32::from(slot),
+                RegisterSpace: ROOT_CBV_SPACE,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            },
+        },
+        ShaderVisibility: visibility,
+    };
+    [
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: USER_DATA_SPACE,
+                    Num32BitValues: MESH_LAUNCH_USER_DWORDS,
+                },
+            },
+            ShaderVisibility: visibility,
+        },
+        view(D3D12_ROOT_PARAMETER_TYPE_SRV, MESH_LAUNCH_SLOT_RECORD),
+        view(D3D12_ROOT_PARAMETER_TYPE_SRV, MESH_LAUNCH_SLOT_COUNT),
+        view(D3D12_ROOT_PARAMETER_TYPE_UAV, MESH_LAUNCH_SLOT_BUDGET),
+    ]
+}
+
+fn bytecode(bytes: &[u8]) -> D3D12_SHADER_BYTECODE {
+    D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() }
+}
+
+/// [`mesh_pipeline`] with the amplification stage `as_` in front of `ms`.
+pub(crate) fn mesh_pipeline_amplified(
+    device: &ID3D12Device,
+    root: &ID3D12RootSignature,
+    (as_, ms, ps): (D3D12_SHADER_BYTECODE, D3D12_SHADER_BYTECODE, D3D12_SHADER_BYTECODE),
+    g: &GraphicsState,
+    depth_bounds: bool,
+    name: &str,
+) -> windows::core::Result<ID3D12PipelineState> {
+    use windows::core::Interface;
+    #[repr(C)]
+    struct Stream<D> {
+        root: Sub<*mut std::ffi::c_void>,
+        as_: Sub<D3D12_SHADER_BYTECODE>,
+        ms: Sub<D3D12_SHADER_BYTECODE>,
+        ps: Sub<D3D12_SHADER_BYTECODE>,
+        blend: Sub<D3D12_BLEND_DESC>,
+        mask: Sub<u32>,
+        raster: Sub<D3D12_RASTERIZER_DESC>,
+        depth: Sub<D>,
+        targets: Sub<D3D12_RT_FORMAT_ARRAY>,
+        dsv: Sub<DXGI_FORMAT>,
+        samples: Sub<DXGI_SAMPLE_DESC>,
+        topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+    }
+    macro_rules! stream {
+        ($depth:expr) => {
+            Stream {
+                root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+                as_: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, as_),
+                ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
+                ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
+                blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+                mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
+                raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
+                depth: $depth,
+                targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
+                dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
+                samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
+                topology: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE),
+            }
+        };
+    }
+    if depth_bounds {
+        let mut s = stream!(Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()));
+        stream_pipeline(device, &mut s, name)
+    } else {
+        let mut s = stream!(Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth));
+        stream_pipeline(device, &mut s, name)
     }
 }
 

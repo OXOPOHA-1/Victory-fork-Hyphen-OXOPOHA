@@ -289,6 +289,9 @@ fn end() {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
+    // The raw shader capture's queue written out (`VICTORY_RAW_SAVE`).
+    victory_gpu::device::raw_save_finish();
+    victory_core::causes::log_summary();
     // SAFETY: ends this process, as the console ends a suspended title.
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }

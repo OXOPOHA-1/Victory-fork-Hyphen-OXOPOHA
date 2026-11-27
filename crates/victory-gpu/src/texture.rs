@@ -73,6 +73,10 @@ pub(crate) struct Staging {
     /// buffers and goes back to it ([`staging_buffer`]); 0: a buffer of its
     /// own, released when this is dropped.
     pooled: u64,
+    /// `VICTORY_REUSE=2`: where it is kept when its texture is released
+    /// ([`STAGING_AT`]).
+    #[cfg(windows)]
+    at: Option<StagingAt>,
 }
 
 /// A staging buffer nothing holds: the buffer and where it is mapped.
@@ -186,6 +190,127 @@ unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
+/// A remap is the title telling us that a physical chunk has just become
+/// available at a virtual address — a chunk-ready signal, not just a memory
+/// write. A streamed texture that shows only some of its levels is read at
+/// most every 30 frames otherwise, so a mip that lands between two looks
+/// waits half a second. Remembering where remaps landed lets the next look
+/// happen at once when the bytes it needs arrived. Kept coarse: a remap
+/// range is a page run, and a texture's pages are contiguous in its layout.
+#[cfg(windows)]
+static READY_AT: std::sync::OnceLock<
+    Mutex<std::collections::BTreeMap<u64, (u64, u64)>>,
+> = std::sync::OnceLock::new();
+
+/// The remapped runs: disjoint, by start, each with its end and the frame
+/// of its latest remap.
+#[cfg(windows)]
+fn ready_map() -> &'static Mutex<std::collections::BTreeMap<u64, (u64, u64)>> {
+    READY_AT.get_or_init(Default::default)
+}
+
+/// Note that `[from, to)` was just mapped. Called from the runtime's remap
+/// hook. `VICTORY_REMAP_READY=0` turns it off.
+#[cfg(windows)]
+pub(crate) fn remap_ready(from: usize, to: usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_READY").is_none_or(|v| v != "0")) {
+        return;
+    }
+    if to <= from {
+        return;
+    }
+    let frame = crate::frame::current();
+    let (mut from, mut to) = (from as u64, to as u64);
+    let mut map = ready_map().lock().unwrap_or_else(|e| e.into_inner());
+    // Coalesce with the overlapping and touching runs around it, not the
+    // whole map: page mappings arrive one after the other, so the same
+    // texture's pages form one run. The run takes this remap's frame
+    // (coarse: a texture in an older part of it is looked at once more).
+    if let Some((&start, &(stop, _))) = map.range(..=from).next_back()
+        && stop >= from
+    {
+        from = start;
+        to = to.max(stop);
+        map.remove(&start);
+    }
+    while let Some((&start, &(stop, _))) = map.range(from..=to).next() {
+        to = to.max(stop);
+        map.remove(&start);
+    }
+    map.insert(from, (to, frame));
+    // Bound the map: a long run maps many addresses that are not textures.
+    // A remap older than the 30-frame wait cuts nothing short any more.
+    const MOST: usize = 4096;
+    if map.len() > MOST {
+        map.retain(|_, &mut (_, at)| at + 30 > frame);
+        while map.len() > MOST {
+            map.pop_first();
+        }
+    }
+}
+
+/// Whether bytes of `[at, at + len)` were remapped in frame `since` or
+/// later (the frame of the texture's last partial read): a partly mapped
+/// texture should be looked at now rather than waiting out its 30-frame
+/// timer. A remap counts once: once the texture has been read in a later
+/// frame it waits again.
+#[cfg(windows)]
+fn ready_since(at: usize, len: usize, since: u64) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_READY").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    let map = ready_map().lock().unwrap_or_else(|e| e.into_inner());
+    let end = (at + len) as u64;
+    // The runs are disjoint and sorted, so their ends fall with their
+    // starts: going down from the last one starting before `end`, those
+    // reaching past `at` are the ones the texture overlaps (a texture can
+    // span several, each with its own frame).
+    let found = map
+        .range(..end)
+        .rev()
+        .take_while(|&(_, &(to, _))| to > at as u64)
+        .any(|(_, &(_, frame))| frame >= since);
+    #[cfg(feature = "diagnostics")]
+    READY_HITS.fetch_add(u64::from(found), std::sync::atomic::Ordering::Relaxed);
+    found
+}
+
+/// Partly mapped textures whose 30-frame wait was cut short by a remap
+/// since the last frame line.
+#[cfg(feature = "diagnostics")]
+pub(crate) static READY_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_REUSE=2`: the staging buffers of textures the title released
+/// ([`forget`]), by where their bytes come from, not by the title object
+/// that named them. Streaming releases a texture and makes a new one at
+/// the same address with the same layout: its detiled bytes and the hash
+/// saying what guest memory they came from are still good. A new object
+/// then takes the buffer out of here instead of detiling the same chunk
+/// again. A live texture's staging is never in here, so the sweep
+/// ([`let_go_idle`]) and [`unstage`] treat it like any other. Not validated
+/// in a game run.
+#[cfg(windows)]
+static STAGING_AT: Mutex<Option<HashMap<StagingAt, Arc<Staging>>>> = Mutex::new(None);
+
+/// The key of [`STAGING_AT`]: the guest address, the layout's size, and
+/// the host texture's format, width, height, depth or layers and levels,
+/// so memory given to another layout or format cannot hit an old buffer
+/// (the console layout follows from those).
+#[cfg(windows)]
+type StagingAt = (u64, u64, i32, u64, u32, u16, u16);
+
+#[cfg(windows)]
+fn staging_at_key(resource: This, texture: &ID3D12Resource) -> Option<StagingAt> {
+    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    let layout = crate::resource::texture_layout(&desc)?;
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    Some((memory as u64, layout.planes[0].layout.size, d.Format.0, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels))
+}
+
 /// The buffer a texture the host writes is copied through into the texture
 /// of a view the title placed in its memory in another format
 /// ([`alias`]): every level of every layer as each of the two formats lays
@@ -250,6 +375,16 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 };
                 let parts = count(&of_from);
                 if parts == 0 || parts > ALIAS_PARTS || parts != count(&of_to) {
+                    return false;
+                }
+                // The render scale (nothing at 100): the source is a scaled
+                // target, the view never is, so no texel copy joins them.
+                // Said and counted; the view is filled from title memory,
+                // as for any alias copy not made.
+                if crate::resource::render_scale() != 100
+                    && (of_from.Width, of_from.Height) != (of_to.Width, of_to.Height)
+                {
+                    crate::resource::scale_left_out(4, "an alias copy");
                     return false;
                 }
                 let mut rows = [(); 2]
@@ -549,7 +684,7 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
+    let idle_frames = 4 * crate::host::idle_scale();
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
@@ -564,7 +699,7 @@ pub(crate) fn let_go_idle() {
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|_, s| {
         let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, idle_frames);
         if !keep {
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
@@ -573,6 +708,11 @@ pub(crate) fn let_go_idle() {
         }
         keep
     });
+    // `VICTORY_REUSE=2`: those of released textures no new one took.
+    #[cfg(windows)]
+    if let Some(at) = STAGING_AT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        at.retain(|_, s| !crate::host::long_ago(s.used.load(Relaxed), idle_ms, idle_frames));
+    }
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
@@ -659,9 +799,35 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&resource);
+    let staging = map.as_mut().and_then(|map| map.remove(&resource));
+    // `VICTORY_REUSE=2`: kept by address for the next texture there, if no
+    // list holds it (a list's upload may still read it on the card).
+    #[cfg(windows)]
+    if let Some(s) = staging
+        && Arc::strong_count(&s) == 1
+        && let Some(key) = s.at
+        && crate::resource::reuse_staging()
+    {
+        let mut at = STAGING_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let at = at.get_or_insert_with(HashMap::new);
+        // Bounded: it holds detiled bytes of textures the title has
+        // released, and a long run streams many. (Which ones go is not
+        // the oldest: a shortcut, not a cache to tune.)
+        const MOST: usize = 256;
+        const MOST_BYTES: u64 = 256 << 20;
+        while !at.is_empty()
+            && (at.len() >= MOST || at.values().map(|s| s.bytes).sum::<u64>() + s.bytes > MOST_BYTES)
+        {
+            let Some(old) = at.keys().next().copied() else {
+                break;
+            };
+            at.remove(&old);
+        }
+        if s.bytes <= MOST_BYTES {
+            at.insert(key, s);
+        }
     }
+    drop(map);
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
@@ -683,6 +849,39 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// Title textures whose contents reached a host copy for the first time
+/// (the submission that carried their first upload): for draws and copies
+/// that read them, count and bytes; then for the pass over textures shaders
+/// pick by index ([`as_pass`]), count and bytes. A texture a draw reads
+/// through a table is uploaded by that draw's own list, so the first pair
+/// is the textures draws needed and got in the same submission.
+pub(crate) static FIRST_CONTENT: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Uploads asked for that could make no contents (no console layout, an
+/// XOR mode, no host, no staging buffer): the texture stays as its host
+/// copy was made, zeros.
+pub(crate) static NO_CONTENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+std::thread_local! {
+    /// Whether the uploads recorded on this thread now are the pass's over
+    /// textures picked by index ([`as_pass`]).
+    static FOR_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the uploads it records counted as the pass's over textures
+/// picked by index ([`FIRST_CONTENT`]).
+pub(crate) fn as_pass<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            FOR_PASS.with(|p| p.set(self.0));
+        }
+    }
+    let _back = Back(FOR_PASS.with(|p| p.replace(true)));
+    f()
+}
+
 /// Records, once per list, the copy of `resource`'s staging buffer into
 /// its host copy, and the detiling that refreshes the staging buffer at
 /// submission if the memory changed. Leaves the texture in the copy
@@ -698,10 +897,11 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if host_written || !list.first_use(resource as usize) {
         return;
     }
+    use std::sync::atomic::Ordering::Relaxed;
     let Some(staging) = staging(resource, texture) else {
+        NO_CONTENT.fetch_add(1, Relaxed);
         return;
     };
-    use std::sync::atomic::Ordering::Relaxed;
     staging.used.store(crate::host::moment(), Relaxed);
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
@@ -798,8 +998,12 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // again if it detiles (the next list then uploads once more).
     {
         let staging = staging.clone();
+        let pass = usize::from(FOR_PASS.with(std::cell::Cell::get)) * 2;
         list.defer_host(move || {
-            staging.uploaded.store(true, Relaxed);
+            if !staging.uploaded.swap(true, Relaxed) {
+                FIRST_CONTENT[pass].fetch_add(1, Relaxed);
+                FIRST_CONTENT[pass + 1].fetch_add(staging.bytes, Relaxed);
+            }
             staging.dirty.store(false, Relaxed);
         });
     }
@@ -1098,7 +1302,10 @@ impl Staging {
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            // The 30-frame timer is a guess at when pages arrive; a remap
+            // says one arrived. Do not make a streamed mip wait for a timer
+            // when its page is already here.
+            if last.partial.is_some_and(|at| frame < at + 30 && !ready_since(start, size, at)) {
                 return 0;
             }
             last.partial = Some(frame);
@@ -1227,6 +1434,7 @@ impl Staging {
                 self.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
+                victory_core::causes::note(victory_core::causes::Cause::TextureDetileFailed);
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
@@ -1474,9 +1682,39 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     if let Some(s) = map.get(&(resource as usize)) {
         return Some(s.clone());
     }
-    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    // A resource recreated at the same address with the same layout finds
+    // the staging buffer its predecessor filled, hash and detiled bytes
+    // intact, and takes it. The detiling of an unchanged chunk is then
+    // skipped. Its host texture is another (or new): the staging says
+    // "not uploaded", so this list uploads it, and the check at submission
+    // still detiles what changed.
+    let key = if crate::resource::reuse_staging() {
+        staging_at_key(resource, texture)
+    } else {
+        None
+    };
+    if let Some(key) = key
+        && let Some(s) = STAGING_AT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .remove(&key)
+        && s.on_demand == on_demand
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        s.uploaded.store(false, Relaxed);
+        s.dirty.store(true, Relaxed);
+        s.used.store(crate::host::moment(), Relaxed);
+        map.insert(resource as usize, s.clone());
+        return Some(s);
+    }
+    let Some((memory, desc)) = crate::resource::texture_memory(resource) else {
+        victory_core::causes::note(victory_core::causes::Cause::TextureNoContentStaging);
+        return None;
+    };
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
+        victory_core::causes::note(victory_core::causes::Cause::TextureNoContentNoLayout);
         once!(
             ?desc,
             "texture contents without a console layout not uploaded"
@@ -1484,10 +1722,14 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         return None;
     };
     if layout.desc.swizzle.xor() {
+        victory_core::causes::note(victory_core::causes::Cause::TextureNoContentXor);
         once!(?desc, "texture contents in an XOR mode not uploaded");
         return None;
     }
-    let host = host()?;
+    let Some(host) = host() else {
+        victory_core::causes::note(victory_core::causes::Cause::TextureNoContentStaging);
+        return None;
+    };
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
@@ -1511,7 +1753,10 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data, pooled) = staging_buffer(host, total)?;
+    let Some((buffer, data, pooled)) = staging_buffer(host, total) else {
+        victory_core::causes::note(victory_core::causes::Cause::TextureNoContentStaging);
+        return None;
+    };
     crate::host::name_frame(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1541,6 +1786,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         pooled,
+        #[cfg(windows)]
+        at: key,
     });
     map.insert(resource as usize, s.clone());
     Some(s)

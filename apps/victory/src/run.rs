@@ -106,6 +106,14 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
+    // Imports the layer does not provide, answered 0 under
+    // `--unimplemented zero`: counted by the loader, put in the summary.
+    victory_core::causes::before_summary(|| {
+        victory_core::causes::observe(
+            victory_core::causes::Cause::CallImportNotImplemented,
+            victory_loader::unimplemented_call_count(),
+        );
+    });
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
@@ -127,6 +135,7 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    victory_core::causes::log_summary();
     println!("title exited with {code}");
     Ok(())
 }

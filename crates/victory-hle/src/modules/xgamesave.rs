@@ -426,6 +426,7 @@ fn no_room(written: u64, replaced: u64, used: u64, free: u64) -> Option<HRESULT>
 }
 
 fn io_error(dir: &Path, e: &std::io::Error) -> HRESULT {
+    victory_core::causes::note(victory_core::causes::Cause::CallSaveRefused);
     tracing::warn!(dir = %dir.display(), %e, "game save");
     if e.kind() == std::io::ErrorKind::StorageFull {
         OUT_OF_LOCAL_STORAGE

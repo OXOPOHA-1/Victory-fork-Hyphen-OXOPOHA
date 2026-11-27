@@ -5,8 +5,8 @@
 
 use std::collections::HashSet;
 
-use super::host::{Dispatch, Host, Root, View};
-use super::{HostShader, lower, validator};
+use super::host::{Dispatch, Host, Root, View, say, skipped};
+use super::{HostShader, HostWaves, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -98,7 +98,7 @@ fn lowered(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Re
     lowered_on(native, p, wide, 32)
 }
 
-/// [`lowered`] for a host whose waves have at most `host_wave` lanes.
+/// [`lowered`] for a host whose waves have 32 to `host_wave` lanes.
 fn lowered_on(
     native: &NativeProgram,
     p: &ir::Program,
@@ -108,7 +108,7 @@ fn lowered_on(
     let st = structure::structure_wide(p, wide).expect("structure");
     let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(p, native).expect("io::raise");
-    let was = lower::TEST_HOST_WAVE.replace(Some(host_wave));
+    let was = lower::TEST_HOST_WAVES.replace(Some(HostWaves { min: 32, max: host_wave }));
     let lowered = lower::lower(&lower::Parts {
         native,
         p,
@@ -120,7 +120,7 @@ fn lowered_on(
         prims: Vec::new(),
         mesh_stride: 0,
     });
-    lower::TEST_HOST_WAVE.set(was);
+    lower::TEST_HOST_WAVES.set(was);
     let lowered = lowered?;
     Ok(HostShader {
         stage: HwStage::Cs,
@@ -180,16 +180,13 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     let in_a_row = terms.iter().copied().reduce(add).unwrap();
     assert_ne!(tree[0], in_a_row, "these terms tell the tree from another order");
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    const TEST: &str = "a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit";
     let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
+        skipped(TEST, "no SM 6.6 hardware device");
         return;
     };
-    let (root, pso) = match host.compute_pipeline(&shader) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
-            return;
-        }
+    let Some((root, pso)) = host.test_pipeline(TEST, &shader, Some(32)) else {
+        return;
     };
     let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     let out = host
@@ -206,7 +203,7 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
         .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
     // (the high half is lane 0's term's: zero)
     assert_eq!(out[0][0], u32::from(tree[0]), "tree {:#x}, in a row {in_a_row:#x}", tree[0]);
-    eprintln!("ran on the hardware device: the sum {:#x} of the console's tree", tree[0]);
+    say(&format!("RAN: {TEST} on {}: the sum {:#x} of the console's tree", host.facts(), tree[0]));
 }
 
 /// The console's 16-bit wave sum where the lanes at or past s0 have left the program (a
@@ -267,7 +264,7 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
         while tree.len() > 1 {
             tree = tree.chunks(2).map(|c| add(c[0], c[1])).collect();
         }
-        let Some(got) = on_the_card(&shader, [stay, 0]) else {
+        let Some(got) = on_the_card("a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit", &shader, 64, [stay, 0]) else {
             return;
         };
         ran = true;
@@ -275,7 +272,7 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
         assert_eq!(got, u32::from(tree[0]), "{stay} lanes stay: got {got:#x}, the console's tree {:#x}", tree[0]);
     }
     if ran {
-        eprintln!("ran on the hardware device: the console's tree with lanes gone, in every case");
+        say("RAN: a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit on the hardware device: the console's tree with lanes gone, in every case");
     }
 }
 
@@ -307,12 +304,12 @@ fn a_16_bit_sum_rounds_to_nearest_when_asked_to() {
             let mut copy = shader.dxil.clone();
             v.validate(&mut copy).expect("DXIL validation failed");
         }
+        const TEST: &str = "a_16_bit_sum_rounds_to_nearest_when_asked_to";
         let Ok(host) = Host::new(false) else {
-            eprintln!("no SM 6.6 hardware device; not run");
+            skipped(TEST, "no SM 6.6 hardware device");
             return;
         };
-        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            eprintln!("the hardware device does not take this program; not run");
+        let Some((root, pso)) = host.test_pipeline(TEST, &shader, None) else {
             return;
         };
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
@@ -329,7 +326,7 @@ fn a_16_bit_sum_rounds_to_nearest_when_asked_to() {
             )
             .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
         let got = out[0][0] & 0xFFFF;
-        eprintln!("v_add_f16 0x3c03 + 0x4000 on the hardware device, nearest {nearest}: {got:#x}");
+        say(&format!("v_add_f16 0x3c03 + 0x4000 on the hardware device, nearest {nearest}: {got:#x}"));
         if nearest {
             assert_eq!(got, 0x4202);
         } else {
@@ -381,16 +378,13 @@ fn a_wave_or_inside(skip: u32, name: &str) {
     // On a GPU that takes waves of 32 (two host waves for the console's one): the OR is of
     // both halves, whichever half's lanes take the branch.
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let test = format!("a_wave_or_inside_a_lane_branch_needs_the_branch_wave_wide ({name})");
     let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
+        skipped(&test, "no SM 6.6 hardware device");
         return;
     };
-    let (root, pso) = match host.compute_pipeline(&shader) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
-            return;
-        }
+    let Some((root, pso)) = host.test_pipeline(&test, &shader, Some(32)) else {
+        return;
     };
     // (threads below s0 take the branch; thread t gives bit t >> 1)
     for (below, expected) in [(64u32, u32::MAX), (40, 0x000F_FFFF), (33, 0x0001_FFFF), (10, 0x1F), (1, 1)] {
@@ -414,20 +408,18 @@ fn a_wave_or_inside(skip: u32, name: &str) {
             .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
         assert_eq!(out[0][0], expected, "{name}: {below} threads in the branch");
     }
-    eprintln!("ran on the hardware device ({name}): the OR of both halves in every case");
+    say(&format!("RAN: {test} on {}: the OR of both halves in every case", host.facts()));
 }
 
-/// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
-/// of the UAV; None (and a line) without a device that takes it.
-fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
+/// Runs `shader`, pinned to `WaveSize(lanes)`, on the hardware device with the root constants
+/// `s0`, `s1` and gives dword 0 of the UAV; None (and a SKIPPED line) without a device that
+/// takes it ([`Host::test_pipeline`]: a panic where the card offers `lanes` and refuses).
+fn on_the_card(test: &str, shader: &HostShader, lanes: u32, constants: [u32; 2]) -> Option<u32> {
     let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
+        skipped(test, "no SM 6.6 hardware device");
         return None;
     };
-    let Ok((root, pso)) = host.compute_pipeline(shader) else {
-        eprintln!("the hardware device does not take this program; not run");
-        return None;
-    };
+    let (root, pso) = host.test_pipeline(test, shader, Some(lanes))?;
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
         if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
@@ -475,10 +467,12 @@ fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
     }
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for (below, other, expected) in [(32u32, 0u32, u32::MAX), (10, 0, 0x3FF), (0, 0, 0), (10, 1, 5)] {
-        let Some(got) = on_the_card(&shader, [below, other]) else { return };
+        let Some(got) = on_the_card("a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is", &shader, 32, [below, other]) else {
+            return;
+        };
         assert_eq!(got, expected, "{below} lanes in the mask, s1 = {other}");
     }
-    eprintln!("ran on the hardware device: the mask's bits, or the number");
+    say("RAN: a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is on the hardware device: the mask's bits, or the number");
 }
 
 /// A 32-lane console wave. `if (t < s0) { ... SCC = (s1 == 7) }` and a branch on SCC after
@@ -525,8 +519,70 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // (lanes below s0 inside, s1) -> what lane 31 stores: 2 if SCC was set at the branch
     for (below, s1, expected) in [(0u32, 7u32, 1u32), (10, 7, 2), (10, 3, 1), (32, 3, 1), (32, 7, 2)] {
-        let Some(got) = on_the_card(&shader, [below, s1]) else { return };
+        let Some(got) = on_the_card("scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide", &shader, 32, [below, s1]) else {
+            return;
+        };
         assert_eq!(got, expected, "{below} lanes inside, s1 = {s1}");
     }
-    eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
+    say("RAN: scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide on the hardware device: the inner test's SCC for every lane once some lane is inside");
+}
+
+/// The whole translation (`emit`) on cards of several wave ranges: a compute program that
+/// reads other lanes is refused by name, and counted, where the card does not offer the
+/// size it is pinned to, and translated where it does.
+#[test]
+fn programs_pinned_to_a_wave_size_the_card_lacks_are_refused_by_name() {
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let translate = |native: &NativeProgram, h: HostWaves| {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, native).expect("io::raise");
+        let was = lower::TEST_HOST_WAVES.replace(Some(h));
+        let r = super::emit(&c, native, &p, &st, &io, &res);
+        lower::TEST_HOST_WAVES.set(was);
+        r
+    };
+    // A console wave64 program with a wave OR (lanes read across the whole wave), and a
+    // console wave32 one that reads a lane mask as a number.
+    let wave64 = program(0xBF88_0000);
+    let wave32 = native_of(
+        &[
+            0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0
+            0x7E00_026A, // v_mov_b32 v0, vcc_lo
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        ],
+        false,
+        32,
+    );
+    let refused = |r: &Result<HostShader, ShaderError>| match r {
+        Err(ShaderError::Unsupported { what, .. }) if *what == super::NO_WAVE_32 => Some(32),
+        Err(ShaderError::Unsupported { what, .. }) if *what == super::NO_WAVE_64 => Some(64),
+        _ => None,
+    };
+    let range = |min, max| HostWaves { min, max };
+    let before = super::wave_refusals();
+    // Neither size: both refused, by name.
+    assert_eq!(refused(&translate(&wave64, range(8, 16))), Some(64));
+    assert_eq!(refused(&translate(&wave32, range(8, 16))), Some(32));
+    // 64 only: the wave32 program is refused, the wave64 one translates.
+    assert_eq!(refused(&translate(&wave32, range(64, 64))), Some(32));
+    let r = translate(&wave64, range(64, 64));
+    assert!(r.is_ok(), "{:?}", r.err());
+    // Both: both translate.
+    for native in [&wave64, &wave32] {
+        let r = translate(native, range(32, 64));
+        assert!(r.is_ok(), "{:?}", r.err());
+    }
+    // 32 only: the wave32 program translates.
+    let r = translate(&wave32, range(16, 32));
+    assert!(r.is_ok(), "{:?}", r.err());
+    // Not known: nothing refused for its wave size.
+    assert_eq!(refused(&translate(&wave32, HostWaves::UNKNOWN)), None);
+    let after = super::wave_refusals();
+    assert_eq!([after[0] - before[0], after[1] - before[1]], [2, 1]);
+    let line = super::wave_refusal_line().expect("a status line");
+    assert!(line.starts_with("translations refused for wave size: "), "{line}");
 }

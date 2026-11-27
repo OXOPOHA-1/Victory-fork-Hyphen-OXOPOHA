@@ -1782,6 +1782,9 @@ pub fn title_memory_committed(at: usize, len: usize) {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // A remap is a chunk-ready signal for a streamed texture, not just a
+    // write to memory: let a partly mapped texture be looked at at once.
+    crate::texture::remap_ready(at, at.saturating_add(len));
     // Stored pages followed there end (`VICTORY_BACK_READS`): counted only.
     #[cfg(feature = "diagnostics")]
     crate::backreads::remapped(at, len);
@@ -1791,8 +1794,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
-    // And nothing stays in place over it.
-    crate::inplace::title_memory_freeing(at, len);
+    // And nothing stays in place over it. Without the wait: this runs
+    // under the mapping lock, which the submitting thread needs to let a
+    // heap go (view memory has no pins, so there is nothing to wait for).
+    crate::inplace::title_memory_still_pinned(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();

@@ -31,10 +31,13 @@ fn kinds() -> &'static [(u64, u32, u32)] {
     static KINDS: OnceLock<Vec<(u64, u32, u32)>> = OnceLock::new();
     KINDS.get_or_init(|| {
         const DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
+        // Shaders write the ocean's textures and the title reads them back
+        // on the CPU; without those copies the boats sink and the surface
+        // is wrong. On by default; `VICTORY_TEXTURE_BACK=0` turns it off.
         let list = match std::env::var("VICTORY_TEXTURE_BACK").as_deref() {
-            Ok("1") => DEFAULT.to_owned(),
+            Ok("0") => String::new(),
+            Ok("1") | Err(_) => DEFAULT.to_owned(),
             Ok(spec) => spec.to_owned(),
-            Err(_) => String::new(),
         };
         let kinds: Vec<(u64, u32, u32)> = list
             .split(',')
@@ -219,12 +222,14 @@ pub(crate) fn land(back: &Back) {
     let mut tiled = vec![0u8; size];
     // Keep title bytes the subresources do not cover.
     if !crate::host::read_into(at as *const u8, &mut tiled) {
+        victory_core::causes::note(victory_core::causes::Cause::TextureBackLost);
         return;
     }
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
         if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+            victory_core::causes::note(victory_core::causes::Cause::TextureBackLost);
             return;
         }
     }
@@ -236,6 +241,7 @@ pub(crate) fn land(back: &Back) {
         // SAFETY: the subresource's part of the mapped buffer.
         let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
         if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
+            victory_core::causes::note(victory_core::causes::Cause::TextureBackLost);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
             // SAFETY: mapped above.

@@ -107,10 +107,16 @@ static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 fn wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
+        // A frame that needs a host pipeline not made yet used to block for
+        // up to half a second. That is a visible hitch in menus and loading
+        // screens, where shaders appear for the first time. One frame's
+        // budget keeps the wait short; the draw returns next frame once the
+        // worker has made the pipeline. `VICTORY_PIPELINE_WAIT_MS=<n>`
+        // overrides; 0 never waits.
         let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(500);
+            .unwrap_or(24);
         tracing::info!(millis, "host pipeline wait budget per frame");
         Duration::from_millis(millis)
     })
@@ -136,7 +142,43 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
-    p.made.get()?.as_ref()
+    let made = p.made.get();
+    LATE.with(|late| late.set(made.is_none()));
+    made?.as_ref()
+}
+
+thread_local! {
+    /// Whether this thread's last [`ready`] found its pipeline not made yet
+    /// when the frame's wait ran out (not: made and refused).
+    static LATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Draws, mesh dispatches, dispatches and indirect executions dropped
+/// because their host pipeline was still being made when the frame's wait
+/// ([`wait_budget`], `VICTORY_PIPELINE_WAIT_MS`) ran out, since the last
+/// call of [`take_late_drops`].
+static LATE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// At a draw (or dispatch) dropped without a host pipeline, on the thread
+/// that looked the pipeline up: counts it in [`LATE_DROPS`] if that look
+/// found the pipeline not made yet. Only counts: the draw is dropped
+/// either way.
+pub(crate) fn note_drop() {
+    if LATE.with(|late| late.replace(false)) {
+        LATE_DROPS.fetch_add(1, Ordering::Relaxed);
+        crate::framelog::add(crate::framelog::T::PipelineLateDrops, 1);
+    }
+}
+
+/// Whether this thread's last [`ready`] found its pipeline not made yet
+/// when the frame's wait ran out (a look only: [`note_drop`] still counts).
+pub(crate) fn last_look_late() -> bool {
+    LATE.with(std::cell::Cell::get)
+}
+
+/// [`LATE_DROPS`], and starts counting again.
+pub(crate) fn take_late_drops() -> u64 {
+    LATE_DROPS.swap(0, Ordering::Relaxed)
 }
 
 /// Pipelines made again for the formats bound at a draw, since the start.
@@ -362,7 +404,19 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        // The old cap of eight left most of a 20-core machine idle while
+        // first-use shaders were being compiled in a menu. Half the logical
+        // processors, up to 32; `VICTORY_PIPELINE_WORKERS=<n>` overrides.
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let workers = *N.get_or_init(|| {
+            std::env::var("VICTORY_PIPELINE_WORKERS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism().map_or(2, |n| n.get() / 2)
+                })
+                .clamp(2, 32)
+        });
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))

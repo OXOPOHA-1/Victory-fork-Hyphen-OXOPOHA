@@ -9,8 +9,24 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{Interface, PCSTR};
 
-use super::HostShader;
 use super::container::SigElement;
+use super::{HostShader, HostWaves};
+
+/// A line from a test that the test harness's output capture does not
+/// swallow: written to the process's standard error directly, so skips and
+/// the device a test ran on show in every `cargo test` run, passed or not.
+#[cfg(test)]
+pub fn say(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
+/// A test that did not run its check, and why ([`say`]). Cargo still counts
+/// it as passed; this line is what tells the two apart.
+#[cfg(test)]
+pub fn skipped(test: &str, why: &str) {
+    say(&format!("SKIPPED (cargo counts it as passed): {test}: {why}"));
+}
 use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
@@ -120,6 +136,84 @@ impl Host {
                 ));
             }
             Ok(Host { device })
+        }
+    }
+
+    /// The device's wave lane range (`WaveLaneCountMin/Max`), or
+    /// [`HostWaves::UNKNOWN`] when the query fails.
+    pub fn waves(&self) -> HostWaves {
+        let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: a feature query into a struct of the size given.
+        let asked = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut o1).cast(),
+                size_of_val(&o1) as u32,
+            )
+        };
+        match asked {
+            Ok(()) => HostWaves {
+                min: o1.WaveLaneCountMin,
+                max: o1.WaveLaneCountMax,
+            },
+            Err(_) => HostWaves::UNKNOWN,
+        }
+    }
+
+    /// The adapter's name and its wave lane range, for test output.
+    pub fn facts(&self) -> String {
+        // SAFETY: plain DXGI calls with valid out pointers.
+        let name = unsafe {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .ok()
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(self.device.GetAdapterLuid()).ok())
+                .and_then(|a| a.GetDesc1().ok())
+                .map(|d| {
+                    let end = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+                    String::from_utf16_lossy(&d.Description[..end])
+                })
+        };
+        let w = self.waves();
+        format!(
+            "{} ({})",
+            name.as_deref().unwrap_or("adapter name not readable"),
+            super::host_wave_line(w)
+        )
+    }
+
+    /// A test's compute pipeline for `cs`, which `lanes` says is pinned to
+    /// `WaveSize(lanes)` (or not pinned: `None`). When the device refuses
+    /// it: a SKIPPED line and `None` where the card's range does not offer
+    /// `lanes` (or nothing is pinned and the driver says why); a panic where
+    /// the card says it offers `lanes` and still refuses, since that is a
+    /// failure of the translation on this card, not a missing feature.
+    #[cfg(test)]
+    pub fn test_pipeline(
+        &self,
+        test: &str,
+        cs: &HostShader,
+        lanes: Option<u32>,
+    ) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
+        match self.compute_pipeline(cs) {
+            Ok(made) => Some(made),
+            Err(e) => {
+                let w = self.waves();
+                match lanes {
+                    Some(n) if w.offers(n) => panic!(
+                        "{test}: the card refused a program pinned to WaveSize({n}) although it reports \
+                         waves of {} to {} lanes: {e} [{}]",
+                        w.min,
+                        w.max,
+                        self.facts()
+                    ),
+                    Some(n) => skipped(
+                        test,
+                        &format!("the card refused WaveSize({n}): it offers {} to {} lanes ({e}) [{}]", w.min, w.max, self.facts()),
+                    ),
+                    None => skipped(test, &format!("the card refused the pipeline: {e} [{}]", self.facts())),
+                }
+                None
+            }
         }
     }
 

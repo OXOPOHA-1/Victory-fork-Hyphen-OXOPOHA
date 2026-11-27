@@ -2,13 +2,19 @@
 //! offline batch. Translated shaders do not need it: they carry the
 //! container hash we compute (`container::hash`).
 //!
-//! The DLL is found at `VICTORY_DXIL` if set, else the newest Windows SDK's
-//! `bin\<version>\x64\dxil.dll`, else wherever `LoadLibrary` finds it.
+//! Use the newest installed Windows SDK validator. `VICTORY_DXIL` may
+//! select another installed SDK version by its full path.
 
-use std::ffi::c_void;
-use std::path::PathBuf;
+use std::ffi::{OsString, c_void};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE, MAX_PATH};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
+use windows_sys::Win32::UI::Shell::{CSIDL_PROGRAM_FILESX86, SHGetFolderPathW};
 
 type Hresult = i32;
 
@@ -110,53 +116,114 @@ static BLOB_VTABLE: BlobVtable = BlobVtable {
 
 pub struct Validator {
     object: Object,
+    module: HMODULE,
 }
 
 // SAFETY: the validator object is free-threaded (DXC's validator has no
 // thread affinity); calls are serialised by `&mut self`.
 unsafe impl Send for Validator {}
 
-impl Validator {
-    /// Where `dxil.dll` is looked for.
-    pub fn default_path() -> Option<PathBuf> {
-        if let Some(p) = std::env::var_os("VICTORY_DXIL") {
-            return Some(p.into());
+/// Enumerate only installed SDKs under Windows' Program Files (x86).
+/// Do not consult PATH, the current directory, or a user-supplied SDK root.
+fn installed_validators() -> &'static [PathBuf] {
+    static INSTALLED: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let mut buf = [0u16; MAX_PATH as usize];
+        // SAFETY: the documented MAX_PATH output buffer, current user, no window.
+        let hr = unsafe {
+            SHGetFolderPathW(
+                std::ptr::null_mut(),
+                CSIDL_PROGRAM_FILESX86 as i32,
+                std::ptr::null_mut(),
+                0,
+                buf.as_mut_ptr(),
+            )
+        };
+        if hr < 0 {
+            return Vec::new();
         }
-        let kits = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\bin");
-        let mut versions: Vec<PathBuf> = std::fs::read_dir(&kits)
-            .ok()?
+        let Some(end) = buf.iter().position(|&c| c == 0) else {
+            return Vec::new();
+        };
+        let root = PathBuf::from(OsString::from_wide(&buf[..end]));
+        let bin = root.join(r"Windows Kits\10\bin");
+        let (Ok(root), Ok(entries)) = (root.canonicalize(), bin.read_dir()) else {
+            return Vec::new();
+        };
+        let mut versions: Vec<_> = entries
             .filter_map(Result::ok)
-            .map(|e| e.path().join(r"x64\dxil.dll"))
-            .filter(|p| p.exists())
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let mut parts = name.to_str()?.split('.');
+                let mut version = [0u32; 4];
+                for field in &mut version {
+                    *field = parts.next()?.parse().ok()?;
+                }
+                if parts.next().is_some() {
+                    return None;
+                }
+                let tail = Path::new(r"Windows Kits\10\bin")
+                    .join(name)
+                    .join(r"x64\dxil.dll");
+                let path = entry.path().join(r"x64\dxil.dll");
+                // A junction or symlink into a writable folder is not an installed validator.
+                (path.is_file() && path.canonicalize().ok()? == root.join(tail))
+                    .then_some((version, path))
+            })
             .collect();
-        versions.sort();
-        versions.pop()
+        versions.sort_unstable();
+        versions.into_iter().map(|(_, path)| path).collect()
+    })
+}
+
+fn select<'a>(installed: &'a [PathBuf], requested: Option<&Path>) -> Option<&'a PathBuf> {
+    match requested {
+        Some(path) => installed
+            .iter()
+            .find(|p| p.as_os_str().eq_ignore_ascii_case(path.as_os_str())),
+        None => installed.last(),
+    }
+}
+
+impl Validator {
+    pub fn default_path() -> Option<PathBuf> {
+        let requested = std::env::var_os("VICTORY_DXIL");
+        select(installed_validators(), requested.as_deref().map(Path::new)).cloned()
     }
 
-    /// Loads `path`'s validator (or `dxil.dll` from the DLL search path).
-    pub fn load(path: Option<&std::path::Path>) -> Result<Self, String> {
-        let name: Vec<u16> = path
-            .map_or_else(|| "dxil.dll".into(), |p| p.as_os_str().to_owned())
-            .to_string_lossy()
-            .encode_utf16()
-            .chain([0])
-            .collect();
-        // SAFETY: plain Win32 calls with a NUL-terminated name.
+    /// Refuse unknown paths before the Windows loader can run any DLL code.
+    pub fn load(path: Option<&Path>) -> Result<Self, String> {
+        let path = path.and_then(|p| select(installed_validators(), Some(p)))
+            .ok_or("no installed x64 Windows SDK validator selected; install the Windows SDK or unset VICTORY_DXIL")?;
+        let name: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: an installed DLL by absolute path; resolve dependencies in System32.
         unsafe {
-            let module = LoadLibraryW(name.as_ptr());
+            let module = LoadLibraryExW(
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            );
             if module.is_null() {
-                return Err(format!("cannot load {}", String::from_utf16_lossy(&name)));
+                return Err(format!(
+                    "cannot load {}: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                ));
             }
-            let create = GetProcAddress(module, c"DxcCreateInstance".as_ptr().cast())
-                .ok_or("dxil.dll lacks DxcCreateInstance")?;
+            let Some(create) = GetProcAddress(module, c"DxcCreateInstance".as_ptr().cast()) else {
+                FreeLibrary(module);
+                return Err("dxil.dll lacks DxcCreateInstance".into());
+            };
             let create: CreateInstance = std::mem::transmute(create);
             let mut object = std::ptr::null_mut();
             let hr = create(&CLSID_DXC_VALIDATOR, &IID_IDXC_VALIDATOR, &mut object);
             if hr < 0 || object.is_null() {
+                FreeLibrary(module);
                 return Err(format!("DxcCreateInstance(validator) failed: {hr:#x}"));
             }
             Ok(Validator {
                 object: object.cast(),
+                module,
             })
         }
     }
@@ -215,7 +282,38 @@ impl Validator {
 
 impl Drop for Validator {
     fn drop(&mut self) {
-        // SAFETY: we own one reference.
-        unsafe { release(self.object) };
+        // SAFETY: release the object while its vtable is still mapped.
+        unsafe {
+            release(self.object);
+            FreeLibrary(self.module);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_installed_validator_can_be_selected() {
+        let sdks = [
+            PathBuf::from(r"C:\SDK\1\x64\dxil.dll"),
+            PathBuf::from(r"C:\SDK\2\x64\dxil.dll"),
+        ];
+        assert_eq!(select(&sdks, None), Some(&sdks[1]));
+        assert_eq!(
+            select(&sdks, Some(Path::new(r"c:\sdk\1\x64\DXIL.DLL"))),
+            Some(&sdks[0])
+        );
+        for p in [
+            "dxil.dll",
+            r".\dxil.dll",
+            r"C:\Games\dxil.dll",
+            r"\\server\share\dxil.dll",
+        ] {
+            assert_eq!(select(&sdks, Some(Path::new(p))), None);
+            assert!(Validator::load(Some(Path::new(p))).is_err());
+        }
+        assert!(Validator::load(None).is_err());
     }
 }

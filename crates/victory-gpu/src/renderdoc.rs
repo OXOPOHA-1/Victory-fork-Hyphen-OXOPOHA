@@ -65,12 +65,15 @@ pub(crate) fn load() {
         }
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::System::LibraryLoader::{
-            GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW,
+            GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
         };
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-        // SAFETY: a NUL-terminated full path, named by the user.
-        let module =
-            unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), LOAD_WITH_ALTERED_SEARCH_PATH) };
+        // SAFETY: a full path named by the user. Import dependencies only
+        // from that installation and System32, not the game folder or PATH.
+        let module = unsafe {
+            LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)
+        };
         if module.is_null() {
             tracing::warn!(path = %path.display(), "VICTORY_RENDERDOC: the DLL does not load");
             return None;
